@@ -184,7 +184,7 @@ impl State {
 
 /// Exponential moving average
 #[derive(Debug)]
-struct MovingAverage {
+pub struct MovingAverage {
     smoothing_factor: f64,
     average: Option<f64>,
     variance: f64,
@@ -192,7 +192,7 @@ struct MovingAverage {
 }
 
 impl MovingAverage {
-    fn new(smoothing_factor: f64) -> Self {
+    pub fn new(smoothing_factor: f64) -> Self {
         Self {
             smoothing_factor,
             average: None,
@@ -212,7 +212,11 @@ impl MovingAverage {
         floor <= value && value <= ceil
     }
 
-    fn update(&mut self, value: f64) {
+    pub fn get_average(&self) -> Option<f64> {
+        self.average
+    }
+
+    pub fn update(&mut self, value: f64) {
         let average = match self.average {
             Some(average) => {
                 let delta = value - average;

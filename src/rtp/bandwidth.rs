@@ -12,6 +12,7 @@ pub struct Bitrate(f64);
 
 impl Bitrate {
     pub const ZERO: Self = Self::new(0);
+    pub const MAX: Self = Self::new(u64::MAX);
 
     pub const fn new(bps: u64) -> Self {
         Bitrate(bps as f64)
@@ -31,6 +32,14 @@ impl Bitrate {
 
     pub fn clamp(&self, min: Self, max: Self) -> Self {
         Self(self.0.clamp(min.0, max.0))
+    }
+
+    pub fn min(&self, other: Self) -> Self {
+        Self(self.as_f64().min(other.as_f64()))
+    }
+
+    pub fn max(&self, other: Self) -> Self {
+        Self(self.as_f64().max(other.as_f64()))
     }
 }
 
