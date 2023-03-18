@@ -8,8 +8,8 @@ use std::cmp::min;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use rtp::Bitrate;
-use rtp::DataSize;
+use crate::rtp::Bitrate;
+use crate::rtp::DataSize;
 
 use super::super_instant::SuperInstant;
 

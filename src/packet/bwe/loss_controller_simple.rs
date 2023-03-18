@@ -3,7 +3,7 @@
 
 // inspired by: https://datatracker.ietf.org/doc/html/draft-ietf-rmcat-gcc-02#section-6
 
-use rtp::Bitrate;
+use crate::rtp::Bitrate;
 
 use super::{
     loss_controller::{DelayDetectorBandwidthUsage, PacketResult},

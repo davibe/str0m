@@ -113,7 +113,7 @@ impl From<Instant> for SuperInstant {
 mod test {
     use std::time::Duration;
 
-    use crate::bwe::super_instant::SuperInstant;
+    use crate::packet::bwe::super_instant::SuperInstant;
 
     #[test]
     fn test() {
