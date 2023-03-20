@@ -15,8 +15,9 @@ use super::super_instant::SuperInstant;
 
 // Inputs
 // - minumum and max bitrate possible (can change dynamically)
-// - a huge amount of other confih -> here ported as consts
+// - a huge amount of other config -> here ported as consts
 // - acknowledged_bitrate: DataRate
+// -
 // - on every twcc feedback
 //   - Vec<PacketResult> (for each packet: receive time if any, first send time, size incl IP layer)
 //   - delay_based_estimated: DataRate
@@ -49,9 +50,33 @@ pub enum DelayDetectorBandwidthUsage {
 }
 
 /// Loss Controller
+///
+/// Usage:
+///
+/// let lbc = LossController::new();
+///
+/// lcb.set_min_bitrate(min_bitrate);
+/// lbc.set_max_bitrate(max_bitrate);
+/// lbc.set_acknowledged_bitrate(acknowledged_bitrate);
+/// lbc.set_delay_based_estimated_bitrate(delay_based_estimated_bitrate);
+/// lbc.set_bandwidth_estimate(bandwidth_estimate); // sideband bandwidth estimate
+///
+/// // when receiving twcc reports
+/// lbc.update_bandwidth_estimate(
+///     packet_results,
+///     delay_based_estimate,
+///     acknowledged_bitrate,
+///     delay_detector_state,
+///     probe_bitrate,
+///     upper_link_capacity,
+///     in_alr,
+/// );
+///
+/// let LossBasedBweResult { bandwidth_estimate, state } = lbc.get_loss_based_result();
+///
+///
 
 // Internat loss controller configuration
-// TODO: move to LossControllerConfig implementing Default trait
 
 const CONF_OBSERVATION_WINDOW_SIZE: usize = 20; // minimum is 2
 const CONF_OBSERVATION_DURATION_LOWER_BOUND: Duration = Duration::from_millis(0);
@@ -68,7 +93,6 @@ const CONF_INITIAL_INHERENT_LOSS_ESTIMATE: f64 = 0.01;
 const CONF_INHERENT_LOSS_UPPER_BOUND_OFFSET: f64 = 0.05;
 const CONF_INHERENT_LOSS_UPPER_BOUND_BANDWIDTH_BALANCE: f64 = 75_000.0; // 75 kbps
 const CONF_INHERENT_LOSS_UPPER_BOUND: f64 = 1.0e-3;
-// const CONF_INITIAL_INHERENT_LOSS_ESTIMATE_WINDOW_SIZE: usize = 10;
 const CONF_NEWTON_ITERATIONS: usize = 3;
 const CONF_NEWTON_STEP_SIZE: f64 = 3.0;
 const CONF_USE_ACKED_BITRATE_ONLY_WHEN_OVERUSING: bool = false;
@@ -177,7 +201,7 @@ impl LossController {
         delay_detector_state: DelayDetectorBandwidthUsage,
         probe_bitrate: Option<Bitrate>,
         upper_link_capacity: Bitrate,
-        _in_alr: bool,
+        in_alr: bool,
     ) {
         self.delay_based_estimate = delay_based_estimated;
         self.upper_link_capacity = upper_link_capacity;
@@ -208,7 +232,7 @@ impl LossController {
         let mut best_candidate = self.current_estimate;
         let mut objective_max = f64::MIN;
 
-        for candidate in self.get_candidates(_in_alr).iter_mut() {
+        for candidate in self.get_candidates(in_alr).iter_mut() {
             self.newtons_method_update(candidate);
 
             let candidate_objective = self.get_objective(&candidate);
@@ -328,7 +352,6 @@ impl LossController {
     }
 
     fn get_candidates(&self, in_alr: bool) -> Vec<ChannelParameters> {
-        // TODO: check; why in_alr is not used ?
         let mut bandwidths = vec![];
 
         let can_increase_bitrate = self.trendline_estimate_allow_bitrate_increase();
