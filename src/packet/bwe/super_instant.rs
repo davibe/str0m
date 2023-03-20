@@ -5,7 +5,7 @@ use std::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 
-/// This is created to ease the modeling of values that represent an moment
+/// This is created to ease the modeling of values that represent a moment
 /// that is far in the future or in the past, yet allowing PartialEq, Ord, Add,
 /// "transparently".
 //

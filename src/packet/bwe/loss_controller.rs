@@ -76,7 +76,8 @@ pub enum DelayDetectorBandwidthUsage {
 ///
 ///
 
-// Internat loss controller configuration
+// Internal loss controller configuration
+// TODO: having this as a struct would be better, especially for the unit tests
 
 const CONF_OBSERVATION_WINDOW_SIZE: usize = 20; // minimum is 2
 const CONF_OBSERVATION_DURATION_LOWER_BOUND: Duration = Duration::from_millis(0);
@@ -560,8 +561,8 @@ impl LossController {
         self.last_send_time_most_recent_observation = last_send_time.into();
 
         let observation = {
-            self.num_observations += 1;
             let id = self.num_observations % CONF_OBSERVATION_WINDOW_SIZE as u64;
+            self.num_observations += 1;
             Observation::with(&self.partial_observation, id)
         };
 
@@ -1003,4 +1004,81 @@ fn distant_past() -> Instant {
 fn distant_future() -> Instant {
     let now = Instant::now();
     now + THOUSAND_YEARS
+}
+
+#[cfg(test)]
+mod test {
+    use std::time::Instant;
+
+    use systemstat::Duration;
+
+    use crate::rtp::{Bitrate, DataSize};
+
+    use super::{
+        LossBasedBweResult, LossController, PacketResult, CONF_OBSERVATION_DURATION_LOWER_BOUND,
+    };
+
+    fn create_packet_results_with_received_packets(first_ts: Instant) -> Vec<PacketResult> {
+        let small = Duration::from_millis(200);
+        let mut result: Vec<PacketResult> = Vec::new();
+
+        for i in 0..3 {
+            result.push(PacketResult {
+                receive_time: Some(first_ts + small + small * i),
+                first_send_time: first_ts + (small * i),
+                size: DataSize::bytes(15_000),
+            })
+        }
+
+        return result;
+    }
+
+    #[test]
+    fn generic_test() {
+        let mut lbc = LossController::new();
+        lbc.set_min_bitrate(Bitrate::from(50_000)); // 50 kbps
+        lbc.set_max_bitrate(Bitrate::from(1_000_000_000)); // 1 Gbps
+
+        let acknowledged_bitrate = Bitrate::from(1_000_000); // 1 Mbps
+        lbc.set_acknowledged_bitrate(acknowledged_bitrate);
+
+        let result = create_packet_results_with_received_packets(Instant::now());
+        lbc.update_bandwidth_estimate(
+            result,
+            acknowledged_bitrate,
+            acknowledged_bitrate,
+            super::DelayDetectorBandwidthUsage::Underusing,
+            None,
+            acknowledged_bitrate,
+            false,
+        );
+
+        let result = create_packet_results_with_received_packets(Instant::now());
+        lbc.update_bandwidth_estimate(
+            result,
+            acknowledged_bitrate,
+            acknowledged_bitrate,
+            super::DelayDetectorBandwidthUsage::Underusing,
+            None,
+            acknowledged_bitrate,
+            false,
+        );
+        let result = create_packet_results_with_received_packets(Instant::now());
+        lbc.update_bandwidth_estimate(
+            result,
+            acknowledged_bitrate,
+            acknowledged_bitrate,
+            super::DelayDetectorBandwidthUsage::Underusing,
+            None,
+            acknowledged_bitrate,
+            false,
+        );
+
+        let LossBasedBweResult {
+            bandwidth_estimate,
+            state,
+        } = lbc.get_loss_based_result();
+
+        println!("{:?} {:?}", bandwidth_estimate, state);
+    }
 }
