@@ -115,7 +115,6 @@ const CONF_NOT_USE_ACKED_RATE_IN_ALR: bool = false;
 
 struct LossController {
     state: LossControllerState,
-    summary: PacketResultsSummary,
     partial_observation: PartialObservation,
     last_send_time_most_recent_observation: SuperInstant,
     observations: Vec<Observation>,
@@ -161,7 +160,6 @@ impl LossController {
     pub fn new() -> LossController {
         let mut controller = LossController {
             state: LossControllerState::DelayBased,
-            summary: PacketResultsSummary::new(),
             partial_observation: PartialObservation::new(),
             last_send_time_most_recent_observation: SuperInstant::DistantFuture,
             observations: vec![Observation::DUMMY; CONF_OBSERVATION_WINDOW_SIZE],
@@ -530,7 +528,9 @@ impl LossController {
             self.delay_detector_states.pop_back();
         }
 
-        let summary = PacketResultsSummary::from(packet_results);
+        let Some(summary) = PacketResultsSummary::from(packet_results) else {
+            return false;
+        };
 
         let last_send_time = summary.last_send_time;
 
@@ -850,22 +850,22 @@ struct PacketResultsSummary {
 }
 
 impl PacketResultsSummary {
-    pub fn new() -> PacketResultsSummary {
+    pub fn new(first_send_time: Instant, last_send_time: Instant) -> PacketResultsSummary {
         PacketResultsSummary {
             num_packets: 0,
             num_lost_packets: 0,
             total_size: 0,
-            first_send_time: distant_future(),
-            last_send_time: distant_past(),
+            last_send_time,
+            first_send_time,
         }
     }
 
-    pub fn from(packet_results: &Vec<PacketResult>) -> PacketResultsSummary {
-        let mut summary = PacketResultsSummary::new();
+    pub fn from(packet_results: &Vec<PacketResult>) -> Option<PacketResultsSummary> {
+        let first = packet_results.first()?;
 
-        summary.num_packets = packet_results.len() as u64;
-
+        let mut summary = PacketResultsSummary::new(first.first_send_time, first.first_send_time);
         for packet in packet_results.iter() {
+            summary.num_packets += 1;
             summary.total_size += packet.size.as_bytes_usize() as u64;
             summary.first_send_time = min(summary.first_send_time, packet.first_send_time);
             summary.last_send_time = max(summary.last_send_time, packet.first_send_time);
@@ -874,7 +874,7 @@ impl PacketResultsSummary {
             }
         }
 
-        summary
+        Some(summary)
     }
 }
 
@@ -986,24 +986,6 @@ impl AsValid<Bitrate> for Bitrate {
 struct LossBasedBweResult {
     bandwidth_estimate: Option<Bitrate>,
     state: LossControllerState,
-}
-
-// time utils
-
-// TODO: remove
-
-// const Duration of 1000 years
-const THOUSAND_YEARS: Duration = Duration::from_secs(1 * 60 * 60 * 24 * 365 * 1000);
-
-// this can easily crash
-fn distant_past() -> Instant {
-    let now = Instant::now();
-    now - THOUSAND_YEARS
-}
-
-fn distant_future() -> Instant {
-    let now = Instant::now();
-    now + THOUSAND_YEARS
 }
 
 #[cfg(test)]
