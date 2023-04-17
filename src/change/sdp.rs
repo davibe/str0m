@@ -777,6 +777,12 @@ fn update_session(session: &mut Session, sdp: &Sdp) {
         .id_of(Extension::TransportSequenceNumber)
         .is_some();
 
+    // Is the video layers allocation rtp header extension enabled?
+    let has_video_layers_allocation = session
+        .exts
+        .id_of(Extension::VideoLayersAllocation)
+        .is_some();
+
     // Since twcc feedback is session wide and not per m-line or pt, we enable it if
     // there are _any_ m-line with a a=rtcp-fb transport-cc parameter and the sequence
     // number header is enabled.

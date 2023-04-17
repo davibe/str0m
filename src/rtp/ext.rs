@@ -1,6 +1,8 @@
 use std::fmt;
 use std::str::from_utf8;
 
+use crate::rtp::vla::VideoLayers;
+
 use super::mtime::MediaTime;
 use super::{Mid, Rid};
 
@@ -27,6 +29,8 @@ pub enum Extension {
     VideoContentType,
     /// <http://www.webrtc.org/experiments/rtp-hdrext/video-timing>
     VideoTiming,
+    /// http://www.webrtc.org/experiments/rtp-hdrext/video-layers-allocation00
+    VideoLayersAllocation,
     /// <urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id>
     ///
     /// UTF8 encoded identifier for the RTP stream. Not the same as SSRC, this is is designed to
@@ -80,6 +84,10 @@ const EXT_URI: &[(Extension, &str)] = &[
     (
         Extension::VideoTiming,
         "http://www.webrtc.org/experiments/rtp-hdrext/video-timing",
+    ),
+    (
+        Extension::VideoLayersAllocation,
+        "http://www.webrtc.org/experiments/rtp-hdrext/video-layers-allocation00",
     ),
     (
         Extension::RtpStreamId,
@@ -162,6 +170,7 @@ impl Extension {
                 | VideoTiming
                 | FrameMarking
                 | ColorSpace
+                | VideoLayersAllocation
         )
     }
 }
@@ -209,6 +218,14 @@ impl ExtensionMap {
         exts.set(10, Extension::RtpStreamId);
         exts.set(11, Extension::RepairedRtpStreamId);
         exts.set(13, Extension::VideoOrientation);
+
+        // Chrome Dev 2023-04-16
+        // with --force-fieldtrials=WebRTC-VideoLayersAllocationAdvertised/Enabled
+        // offers:
+        // a=extmap:14 http://www.webrtc.org/experiments/rtp-hdrext/video-layers-allocation00
+
+        // TODO: remove from default, the user can just enable it since this is not stable
+        exts.set(14, Extension::VideoLayersAllocation);
 
         exts
     }
@@ -287,6 +304,7 @@ impl ExtensionMap {
             .map(|p| p as u8 + 1)
     }
 
+    /// Returns an iterator over all the possible supported extensions
     pub(crate) fn iter(&self, audio: bool) -> impl Iterator<Item = (u8, Extension)> + '_ {
         self.0
             .iter()
@@ -448,6 +466,7 @@ impl Extension {
                 // do nothing
                 todo!()
             }
+            &VideoLayersAllocation => todo!("VideoLayersAllocation"),
         }
     }
 
@@ -517,6 +536,10 @@ impl Extension {
             }
             ColorSpace => {
                 // TODO HDR color space
+            }
+            &VideoLayersAllocation => {
+                let v = VideoLayers::from(buf);
+                info!("VideoLayersAllocation: {:?}", v);
             }
             UnknownUri => {
                 // ignore
@@ -653,6 +676,7 @@ impl fmt::Display for Extension {
                 FrameMarking => "frame-marking07",
                 ColorSpace => "color-space",
                 UnknownUri => "unknown-uri",
+                VideoLayersAllocation => "video-layers-allocation",
             }
         )
     }
