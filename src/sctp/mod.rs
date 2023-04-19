@@ -19,6 +19,8 @@ use dcep::DcepOpen;
 
 use dcep::DcepAck;
 
+use crate::timeout::Timeout;
+
 /// Errors from the SCTP subsystem.
 #[derive(Debug, Error, Eq, Clone, PartialEq)]
 pub enum SctpError {
@@ -626,8 +628,8 @@ impl RtcSctp {
         None
     }
 
-    pub fn poll_timeout(&mut self) -> Option<Instant> {
-        self.assoc.as_mut().and_then(|a| a.poll_timeout())
+    pub fn poll_timeout(&mut self) -> Timeout {
+        Timeout::new(self.assoc.as_mut().and_then(|a| a.poll_timeout()), "sctp")
     }
 
     pub fn push_back_transmit(&mut self, data: VecDeque<Vec<u8>>) {

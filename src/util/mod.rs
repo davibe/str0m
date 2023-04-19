@@ -20,23 +20,6 @@ pub(crate) trait Soonest {
     fn soonest(self, other: Self) -> Self;
 }
 
-impl Soonest for (Option<Instant>, &'static str) {
-    fn soonest(self, other: Self) -> Self {
-        match (self, other) {
-            ((Some(v1), s1), (Some(v2), s2)) => {
-                if v1 < v2 {
-                    (Some(v1), s1)
-                } else {
-                    (Some(v2), s2)
-                }
-            }
-            ((None, _), (None, _)) => (None, ""),
-            ((None, _), (v, s)) => (v, s),
-            ((v, s), (None, _)) => (v, s),
-        }
-    }
-}
-
 /// Calculate the round trip time for a given peer as described in
 /// [RFC3550 6.4.1](https://datatracker.ietf.org/doc/html/rfc3550#section-6.4.1).
 ///

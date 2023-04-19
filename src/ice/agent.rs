@@ -7,6 +7,7 @@ use rand::random;
 use crate::io::{DatagramRecv, Receive, Transmit, DATAGRAM_MTU};
 use crate::io::{Id, DATAGRAM_MTU_WARN};
 use crate::io::{StunMessage, TransId, STUN_TIMEOUT};
+use crate::timeout::Timeout;
 
 use super::candidate::{Candidate, CandidateKind};
 use super::pair::{CandidatePair, CheckState, PairId};
@@ -885,16 +886,19 @@ impl IceAgent {
     /// Poll for the next time to call [`IceAgent::handle_timeout`].
     ///
     /// Returns `None` until the first ever `handle_timeout` is called.
-    pub fn poll_timeout(&mut self) -> Option<Instant> {
+
+    pub fn poll_timeout(&mut self) -> Timeout {
         // if we never called handle_timeout, there will be no current time.
-        let last_now = self.last_now?;
+        let Some(last_now) = self.last_now else {
+            return Timeout::new(None, "ice");
+        };
 
         let has_request = !self.stun_server_queue.is_empty();
         let has_transmit = !self.transmit.is_empty();
 
         // We must empty the queued replies or stuff to send as soon as possible.
         if has_request || has_transmit {
-            return Some(last_now + TIMING_ADVANCE);
+            return Timeout::new(Some(last_now + TIMING_ADVANCE), "ice");
         }
 
         // when do we need to handle the next candidate pair?
@@ -920,7 +924,7 @@ impl IceAgent {
             last_now + Duration::from_secs(3)
         };
 
-        Some(next)
+        Timeout::new(Some(next), "ice")
     }
 
     fn emit_event(&mut self, event: IceAgentEvent) {
@@ -1607,7 +1611,7 @@ mod test {
 
         let now1 = Instant::now();
         agent.handle_timeout(now1);
-        let now2 = agent.poll_timeout().unwrap();
+        let now2 = agent.poll_timeout().t.unwrap();
 
         assert!(now2 - now1 == TIMING_ADVANCE);
     }

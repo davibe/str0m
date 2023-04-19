@@ -503,6 +503,7 @@ mod sdp;
 
 pub mod format;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -554,6 +555,7 @@ use media::{MediaAdded, MediaInner, Mid, PolledPacket, Pt, Rid};
 pub mod change;
 
 mod util;
+use timeout::Timeout;
 pub(crate) use util::*;
 
 mod session;
@@ -562,6 +564,7 @@ use session::{MediaEvent, Session};
 use crate::stats::StatsSnapshot;
 
 pub mod stats;
+pub(crate) mod timeout;
 
 /// Errors for the whole Rtc engine.
 #[derive(Debug, Error)]
@@ -684,6 +687,8 @@ pub struct Rtc {
     peer_bytes_rx: u64,
     peer_bytes_tx: u64,
     change_counter: usize,
+    debug_timeouts_map: HashMap<&'static str, u64>,
+    debug_timeouts_last: Instant,
 }
 
 struct SendAddr {
@@ -827,6 +832,8 @@ impl Rtc {
             peer_bytes_rx: 0,
             peer_bytes_tx: 0,
             change_counter: 0,
+            debug_timeouts_map: HashMap::new(),
+            debug_timeouts_last: Instant::now(),
         }
     }
 
@@ -1181,16 +1188,36 @@ impl Rtc {
             }
         }
 
-        let time_and_reason = (None, "<not happening>")
-            .soonest((self.ice.poll_timeout(), "ice"))
-            .soonest((self.session.poll_timeout(), "session"))
-            .soonest((self.sctp.poll_timeout(), "sctp"))
-            .soonest((self.chan.poll_timeout(&self.sctp), "chan"))
-            .soonest((self.stats.as_mut().and_then(|s| s.poll_timeout()), "stats"));
+        let never = Timeout::new(None, "<not happening>");
+        let timeout = never
+            .soonest(self.ice.poll_timeout())
+            .soonest(self.session.poll_timeout())
+            .soonest(self.sctp.poll_timeout())
+            .soonest(self.chan.poll_timeout(&self.sctp))
+            .soonest(
+                self.stats
+                    .as_mut()
+                    .map(|s| s.poll_timeout())
+                    .unwrap_or(never),
+            );
 
-        // trace!("poll_output timeout reason: {}", time_and_reason.1);
+        // trace!("poll_output timeout reason: {}", time_and_reason.src);
+        {
+            let count = self
+                .debug_timeouts_map
+                .entry(timeout.src)
+                .or_insert_with(|| 1);
 
-        let time = time_and_reason.0.unwrap_or_else(not_happening);
+            *count += 1;
+
+            if self.debug_timeouts_last.elapsed() > Duration::from_secs(1) {
+                info!("Timeouts: {:?}", self.debug_timeouts_map);
+                self.debug_timeouts_map.clear();
+                self.debug_timeouts_last = Instant::now();
+            }
+        }
+
+        let time = timeout.t.unwrap_or_else(not_happening);
 
         // We want to guarantee time doesn't go backwards.
         let next = if time < self.last_now {

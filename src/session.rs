@@ -13,6 +13,7 @@ use crate::rtp::{extend_u32, SRTCP_OVERHEAD};
 use crate::rtp::{Bitrate, ExtensionMap, MediaTime, Mid, Rtcp, RtcpFb};
 use crate::rtp::{SrtpContext, SrtpKey, Ssrc};
 use crate::stats::StatsSnapshot;
+use crate::timeout::Timeout;
 use crate::util::{already_happened, not_happening, Soonest};
 use crate::{net, KeyframeRequest, MediaData};
 use crate::{RtcConfig, RtcError};
@@ -759,28 +760,30 @@ impl Session {
         None
     }
 
-    pub fn poll_timeout(&mut self) -> Option<Instant> {
-        let media = self
-            .medias
-            .iter_mut()
-            .filter_map(|m| m.poll_timeout())
-            .min();
-        let regular_at = Some(self.regular_feedback_at());
-        let nack_at = self.nack_at();
-        let twcc_at = self.twcc_at();
-        let pacing_at = self.pacer.poll_timeout();
-        let bwe_at = self.bwe.as_ref().map(|bwe| bwe.poll_timeout());
+    pub fn poll_timeout(&mut self) -> Timeout {
+        let media = Timeout::new(
+            self.medias
+                .iter_mut()
+                .filter_map(|m| m.poll_timeout())
+                .min(),
+            "media",
+        );
+        let regular_at = Timeout::new(Some(self.regular_feedback_at()), "regular");
+        let nack_at = Timeout::new(self.nack_at(), "nack");
+        let twcc_at = Timeout::new(self.twcc_at(), "twcc");
+        let pacing_at = Timeout::new(self.pacer.poll_timeout(), "pacing");
+        let bwe_at = Timeout::new(self.bwe.as_ref().map(|bwe| bwe.poll_timeout()), "bwe");
 
-        let timeout = (media, "media")
-            .soonest((regular_at, "regular"))
-            .soonest((nack_at, "nack"))
-            .soonest((twcc_at, "twcc"))
-            .soonest((pacing_at, "pacing"))
-            .soonest((bwe_at, "bwe"));
+        let never = Timeout::new(None, "<not happening>");
+        let timeout = never
+            .soonest(media)
+            .soonest(regular_at)
+            .soonest(nack_at)
+            .soonest(twcc_at)
+            .soonest(pacing_at)
+            .soonest(bwe_at);
 
-        // trace!("poll_timeout soonest is: {}", timeout.1);
-
-        timeout.0
+        timeout
     }
 
     pub fn has_mid(&self, mid: Mid) -> bool {

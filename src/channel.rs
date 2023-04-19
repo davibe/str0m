@@ -3,6 +3,7 @@
 use std::{fmt, time::Instant};
 
 use crate::sctp::RtcSctp;
+use crate::timeout::Timeout;
 use crate::util::already_happened;
 use crate::{Rtc, RtcError};
 
@@ -210,7 +211,11 @@ impl ChannelHandler {
         }
     }
 
-    pub fn poll_timeout(&self, sctp: &RtcSctp) -> Option<Instant> {
+    pub fn poll_timeout(&mut self, sctp: &RtcSctp) -> Timeout {
+        Timeout::new(self.do_poll_timeout(sctp), "chan")
+    }
+
+    pub fn do_poll_timeout(&mut self, sctp: &RtcSctp) -> Option<Instant> {
         if sctp.is_inited() && (self.need_allocation() || self.need_open()) {
             Some(already_happened())
         } else {
