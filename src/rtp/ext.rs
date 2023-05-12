@@ -466,7 +466,15 @@ impl Extension {
                 // do nothing
                 todo!()
             }
-            &VideoLayersAllocation => todo!("VideoLayersAllocation"),
+            &VideoLayersAllocation => {
+                // TODO: downgrade or remove
+                info!(
+                    "VideoLayersAllocation write: {:?}",
+                    ev.video_layers_allocation
+                );
+                // TODO: repeating the same params is wrong...
+                ev.video_layers_allocation.as_ref().map(|v| v.write_to(buf))
+            }
         }
     }
 
@@ -538,8 +546,10 @@ impl Extension {
                 // TODO HDR color space
             }
             &VideoLayersAllocation => {
-                let v = VideoLayers::from(buf);
-                info!("VideoLayersAllocation: {:?}", v);
+                let vla = VideoLayers::from(buf);
+                // TODO: downgrade or remove
+                info!("VideoLayersAllocation read: {:?}", vla);
+                v.video_layers_allocation = Some(vla);
             }
             UnknownUri => {
                 // ignore
@@ -553,7 +563,7 @@ impl Extension {
 /// Values in an RTP header extension.
 ///
 /// This is metadata that is available also without decrypting the SRTP packets.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ExtensionValues {
     /// Audio level is measured in negative decibel. 0 is max and a "normal" value might be -30.
     pub audio_level: Option<i8>,
@@ -590,6 +600,8 @@ pub struct ExtensionValues {
     pub mid: Option<Mid>,
     #[doc(hidden)]
     pub frame_mark: Option<u32>,
+    #[doc(hidden)]
+    pub video_layers_allocation: Option<VideoLayers>,
 }
 
 impl fmt::Debug for ExtensionValues {
