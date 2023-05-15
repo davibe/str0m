@@ -1,9 +1,10 @@
-use serde::{Deserialize, Serialize};
-
 /// Video Layer Allocation RTP Header Extension
 ///  ref. https://webrtc.googlesource.com/src/+/refs/heads/main/docs/native-code/rtp-hdrext/video-layers-allocation00
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+const MAX_TARGET_BITRATES: usize = 64;
+const MAX_RESOLUTIONS: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoLayers {
     rid: u8,
 
@@ -17,11 +18,11 @@ pub struct VideoLayers {
     num_temporal_layers: [u8; 4],
 
     /// Vector of stream, spatial, temporal, bitrate sorted by bitrate ASC
-    target_bitrates: Vec<(u8, u8, u8, u64)>,
+    target_bitrates: [(u8, u8, u8, u64); MAX_TARGET_BITRATES],
 
     /// Vector of stream, spatial, (width, height, framerate) sorted by
     /// resolution ASC, optional
-    resolutions: Option<Vec<(u8, u8, (u16, u16, u8))>>,
+    resolutions: Option<[(u8, u8, (u16, u16, u8)); MAX_RESOLUTIONS]>,
 }
 
 impl VideoLayers {
@@ -76,11 +77,32 @@ impl VideoLayers {
         p += 1;
 
         // write the target bitrates for each stream, spatial, temporal layer
-        for (_stream, _spatial, _temporal, bitrate) in &self.target_bitrates {
-            p += write_leb128_unsigned(&mut buf[p..], *bitrate);
+
+        let num_spatial_layers = {
+            let mut num_spatial_layers: [u8; 4] = [0; 4];
+            for i in 0..4 {
+                num_spatial_layers[i] = if i < self.num_rtp_streams as usize {
+                    count_layers_from_bitmask(self.spatial_layer_bitmasks[i])
+                } else {
+                    0
+                };
+            }
+            num_spatial_layers
+        };
+
+        let mut i = 0;
+        for s in 0..self.num_rtp_streams {
+            for sl in 0..num_spatial_layers[s as usize] {
+                for _tl in 0..self.num_temporal_layers[sl as usize] {
+                    let (_stream, _spatial, _temporal, bitrate) = self.target_bitrates[i as usize];
+                    i += 1;
+                    p += write_leb128_unsigned(&mut buf[p..], bitrate);
+                }
+            }
         }
 
         // Write resolutions
+
         if let Some(resolutions) = &self.resolutions {
             for (stream, spatial, (width, height, framerate)) in resolutions {
                 buf[p] = (stream & 0b00000011) << 6;
@@ -182,18 +204,18 @@ impl From<&[u8]> for VideoLayers {
         // full-svc all lower spatial layers are included. All lower temporal
         // layers are also included.
 
-        let mut target_bitrates: Vec<(u8, u8, u8, u64)> = Vec::new();
+        let mut target_bitrates: [(u8, u8, u8, u64); MAX_TARGET_BITRATES] =
+            [(0, 0, 0, 0); MAX_TARGET_BITRATES];
 
+        let mut i = 0;
         for s in 0..num_rtp_streams {
             for sl in 0..num_spatial_layers[s as usize] {
-                let num_temporal_layers = num_temporal_layers[sl as usize];
-                for tl in 0..num_temporal_layers {
+                for tl in 0..num_temporal_layers[sl as usize] {
                     let (bitrate, size) = read_leb128_unsigned(&buf[p..]);
-
                     trace!("VLA: stream: {} spatial layer: {} temporal layer: {} -> bitrate: {}, size: {}, p: {}", s, sl, tl, bitrate, size, p);
-
                     p += size;
-                    target_bitrates.push((s, sl, tl, bitrate))
+                    target_bitrates[i] = (s, sl, tl, bitrate);
+                    i += 1;
                 }
             }
         }
@@ -204,8 +226,10 @@ impl From<&[u8]> for VideoLayers {
         // max frame rate 8-bit per spatial layer per RTP stream. Values are
         // stored in (RTP stream id, spatial id) ascending order.
 
-        let resolutions: Option<Vec<(u8, u8, (u16, u16, u8))>> = if buf.len() - p > 0 {
-            let mut v = Vec::new();
+        let resolutions: Option<[(u8, u8, (u16, u16, u8)); MAX_RESOLUTIONS]> = if buf.len() - p > 0
+        {
+            let mut v = [(0, 0, (0, 0, 0)); MAX_RESOLUTIONS];
+            let mut i = 0;
             for s in 0..num_rtp_streams {
                 let num_spatial_layers =
                     count_layers_from_bitmask(spatial_layer_bitmasks[s as usize]);
@@ -217,7 +241,8 @@ impl From<&[u8]> for VideoLayers {
                     let max_framerate = 1 + u8::from_be_bytes(buf[p..p + 1].try_into().unwrap());
                     p += 1;
 
-                    v.push((s, sl, (width, height, max_framerate)));
+                    v[i] = (s, sl, (width, height, max_framerate));
+                    i += 1;
                 }
             }
             Some(v)
@@ -310,7 +335,7 @@ fn count_layers_from_bitmask(bitmask: u8) -> u8 {
 }
 
 #[cfg(test)]
-mod tests {
+mod vla_tests {
     use super::*;
 
     #[test]
@@ -348,12 +373,16 @@ mod tests {
             num_rtp_streams: 1,
             spatial_layer_bitmasks: [0b1010, 0b0000, 0b0000, 0b0000],
             num_temporal_layers: [2, 1, 3, 1],
-            target_bitrates: vec![
-                // stream 1
-                (0, 0, 0, 100),
-                (0, 0, 1, 100),
-                (0, 1, 0, 100),
-            ],
+            target_bitrates: {
+                let mut bitrates = [(0, 0, 0, 0); MAX_TARGET_BITRATES];
+                bitrates[..3].copy_from_slice(&[
+                    // stream 1
+                    (0, 0, 0, 100),
+                    (0, 0, 1, 100),
+                    (0, 1, 0, 100),
+                ]);
+                bitrates
+            },
             resolutions: None, // Some(vec![(0, 0, (640, 480, 30)), (1, 1, (1280, 720, 60))]),
         };
 
@@ -372,12 +401,16 @@ mod tests {
             num_rtp_streams: 1,
             spatial_layer_bitmasks: [0b1010, 0b1010, 0b1010, 0b1010],
             num_temporal_layers: [2, 1, 3, 1],
-            target_bitrates: vec![
-                // stream 1
-                (0, 0, 0, 100),
-                (0, 0, 1, 200),
-                (0, 1, 0, 400),
-            ],
+            target_bitrates: {
+                let mut bitrates = [(0, 0, 0, 0); MAX_TARGET_BITRATES];
+                bitrates[..3].copy_from_slice(&[
+                    // stream 1
+                    (0, 0, 0, 100),
+                    (0, 0, 1, 200),
+                    (0, 1, 0, 400),
+                ]);
+                bitrates
+            },
             resolutions: None, // Some(vec![(0, 0, (640, 480, 30)), (1, 1, (1280, 720, 60))]),
         };
 
@@ -396,14 +429,18 @@ mod tests {
             num_rtp_streams: 2,
             spatial_layer_bitmasks: [0b1010, 0b0001, 0b0000, 0b0000],
             num_temporal_layers: [2, 1, 3, 1],
-            target_bitrates: vec![
-                // stream 1
-                (0, 0, 0, 100),
-                (0, 0, 1, 200),
-                (0, 1, 0, 400),
-                (1, 0, 0, 800),
-                (1, 0, 1, 1600),
-            ],
+            target_bitrates: {
+                let mut bitrates = [(0, 0, 0, 0); MAX_TARGET_BITRATES];
+                bitrates[..5].copy_from_slice(&[
+                    // stream 1
+                    (0, 0, 0, 100),
+                    (0, 0, 1, 200),
+                    (0, 1, 0, 400),
+                    (1, 0, 0, 800),
+                    (1, 0, 1, 1600),
+                ]);
+                bitrates
+            },
             resolutions: None, // Some(vec![(0, 0, (640, 480, 30)), (1, 1, (1280, 720, 60))]),
         };
 
@@ -416,14 +453,23 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_and_write_binary() {
+    fn test_parse_and_write_chrome() {
+        // this is from Chrome
         let src = string_to_buffer(
             "
-            01001010
-            01001000
-            01100100
-            01100100
-            01100100
+            00100001
+            01010100
+            01110000
+            10111011
+            00000001
+            11010001
+            00000010
+            10110010
+            00000100
+            10000100
+            00000111
+            11011100
+            00001011
             ",
         );
 

@@ -563,7 +563,7 @@ impl Extension {
 /// Values in an RTP header extension.
 ///
 /// This is metadata that is available also without decrypting the SRTP packets.
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExtensionValues {
     /// Audio level is measured in negative decibel. 0 is max and a "normal" value might be -30.
     pub audio_level: Option<i8>,

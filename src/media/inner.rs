@@ -391,7 +391,7 @@ impl MediaInner {
             rtp_time,
             packet,
             rid,
-            header.ext_vals.clone(),
+            header.ext_vals,
             Some(header),
         )?;
 
@@ -1417,8 +1417,8 @@ impl<'a> NextPacketBody<'a> {
     fn ext_vals(&self) -> ExtensionValues {
         use NextPacketBody::*;
         match self {
-            Regular { pkt } => pkt.meta.ext_vals.clone(),
-            Resend { pkt, .. } => pkt.meta.ext_vals.clone(),
+            Regular { pkt } => pkt.meta.ext_vals,
+            Resend { pkt, .. } => pkt.meta.ext_vals,
             Blank { .. } => ExtensionValues::default(),
         }
     }

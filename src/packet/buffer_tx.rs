@@ -23,7 +23,7 @@ pub struct Packetized {
     pub rtp_mode_header: Option<RtpHeader>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct PacketizedMeta {
     pub rtp_time: MediaTime,
     pub ssrc: Ssrc,
@@ -83,7 +83,7 @@ impl PacketizingBuffer {
                 first,
                 marker,
                 data,
-                meta: meta.clone(),
+                meta,
                 queued_at: now,
 
                 seq_no: None,

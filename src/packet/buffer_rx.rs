@@ -41,7 +41,7 @@ impl Depacketized {
     }
 
     pub fn ext_vals(&self) -> ExtensionValues {
-        self.meta[0].header.ext_vals.clone()
+        self.meta[0].header.ext_vals
     }
 }
 
