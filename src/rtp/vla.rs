@@ -6,7 +6,7 @@ const MAX_RESOLUTIONS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoLayers {
-    rid: u8,
+    rtp_stream_index: u8,
 
     /// the number of rtp streams
     num_rtp_streams: u8,
@@ -37,7 +37,7 @@ impl VideoLayers {
         //   (up to 4) one per rtp stream
         //   or 0 if the bitmask is different for each stream
         let mut v = 0_u8;
-        v |= self.rid << 6;
+        v |= self.rtp_stream_index << 6;
         v |= ((self.num_rtp_streams - 1) & 0b00000011) << 4;
 
         let collapse_bitmaps = self.spatial_layer_bitmasks[0] == self.spatial_layer_bitmasks[1]
@@ -251,7 +251,7 @@ impl From<&[u8]> for VideoLayers {
         };
 
         Self {
-            rid,
+            rtp_stream_index: rid,
             num_rtp_streams,
             spatial_layer_bitmasks,
             num_temporal_layers,
@@ -369,7 +369,7 @@ mod vla_tests {
     #[test]
     fn test_vla_rw_1_stream() {
         let video_layers = VideoLayers {
-            rid: 1,
+            rtp_stream_index: 1,
             num_rtp_streams: 1,
             spatial_layer_bitmasks: [0b1010, 0b0000, 0b0000, 0b0000],
             num_temporal_layers: [2, 1, 3, 1],
@@ -397,7 +397,7 @@ mod vla_tests {
     #[test]
     fn test_vla_rw_1_stream_collapsed() {
         let video_layers = VideoLayers {
-            rid: 1,
+            rtp_stream_index: 1,
             num_rtp_streams: 1,
             spatial_layer_bitmasks: [0b1010, 0b1010, 0b1010, 0b1010],
             num_temporal_layers: [2, 1, 3, 1],
@@ -425,7 +425,7 @@ mod vla_tests {
     #[test]
     fn test_vla_rw_2_streams() {
         let video_layers = VideoLayers {
-            rid: 1,
+            rtp_stream_index: 1,
             num_rtp_streams: 2,
             spatial_layer_bitmasks: [0b1010, 0b0001, 0b0000, 0b0000],
             num_temporal_layers: [2, 1, 3, 1],
