@@ -34,12 +34,11 @@ impl ReceiverRegister2 {
     }
 
     pub fn update(&mut self, seq: SeqNo) -> bool {
-        if self.nack.is_none() {
+        let Some(nack) = self.nack.clone() else {
             // automatically pick up the first seq number
             self.nack = Some(seq..seq);
             return true;
-        }
-        let nack = self.nack.clone().expect("active nack range");
+        };
 
         if seq < nack.start {
             // skip old seq numbers, report as not new
