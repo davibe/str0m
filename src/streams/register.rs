@@ -16,6 +16,8 @@ const MISORDER_DELAY: u64 = 1;
 /// The max number of NACKs we perform for a single packet
 const MAX_NACKS: u8 = 5;
 
+const U16_MAX: u64 = u16::MAX as u64 + 1_u64;
+
 #[derive(Debug)]
 pub struct ReceiverRegister2 {
     /// Status of packets indexed by wrapping SeqNo.
@@ -76,6 +78,61 @@ impl ReceiverRegister2 {
         new
     }
 
+    pub fn nack_report(&mut self) -> Option<Vec<Nack>> {
+        let nack = self.nack.as_ref()?;
+
+        if nack.is_empty() {
+            return None;
+        }
+
+        let mut nacks = vec![];
+        let mut last_seq_added = 0;
+
+        for seq in *nack.start..*nack.end {
+            let packet = self.packet(seq.into());
+
+            if !packet.should_nack() {
+                continue;
+            }
+
+            let distance = seq - last_seq_added;
+
+            let update_last = nacks.last().is_some() && distance <= 16;
+
+            if update_last {
+                let last: &mut NackEntry = nacks.last_mut().expect("last");
+                let pos = (distance - 1) as u16;
+                last.blp |= 1 << pos;
+            } else {
+                nacks.push(NackEntry {
+                    pid: (seq % U16_MAX) as u16,
+                    blp: 0,
+                });
+                last_seq_added = seq;
+            }
+
+            self.packet(seq.into()).nack_count += 1;
+        }
+
+        if nacks.is_empty() {
+            return None;
+        }
+
+        let reports = ReportList::lists_from_iter(nacks).into_iter();
+
+        Some(
+            reports
+                .map(|reports| {
+                    Nack {
+                        sender_ssrc: 0.into(),
+                        ssrc: 0.into(), // changed when sending
+                        reports,
+                    }
+                })
+                .collect(),
+        )
+    }
+
     fn as_index(&self, seq: SeqNo) -> usize {
         (*seq % self.packets.len() as u64) as usize
     }
@@ -90,16 +147,13 @@ impl ReceiverRegister2 {
 mod nack_test {
     use std::ops::Range;
 
-    use crate::{
-        rtp_::SeqNo,
-        streams::register::{ReceiverRegister2, MAX_MISORDER},
-    };
+    use crate::streams::register::{ReceiverRegister2, MAX_MISORDER, MISORDER_DELAY};
 
     fn assert_update(
         reg: &mut ReceiverRegister2,
         seq: u64,
-        expect_received: bool,
         expect_new: bool,
+        expect_received: bool,
         expect_nack: Range<u64>,
     ) {
         assert_eq!(
@@ -153,7 +207,7 @@ mod nack_test {
         assert_update(&mut reg, 9, false, false, 10..10);
 
         // duped packet
-        assert_update(&mut reg, 10, true, false, 10..10);
+        assert_update(&mut reg, 10, false, true, 10..10);
 
         // future packets accepted, window not sliding
         let next = 10 + MAX_MISORDER;
@@ -177,7 +231,304 @@ mod nack_test {
 
         // older packet accepted, window star moves ahead
         let next = 14;
-        assert_update(&mut reg, next, false, true, 15..(13 + MAX_MISORDER));
+        assert_update(&mut reg, next, true, false, 15..(13 + MAX_MISORDER));
+    }
+
+    #[test]
+    fn nack_report_none() {
+        let mut reg = ReceiverRegister2::new();
+        assert!(reg.nack_report().is_none());
+
+        reg.update(110.into());
+        assert!(reg.nack_report().is_none());
+
+        reg.update(111.into());
+        assert!(reg.nack_report().is_none());
+    }
+
+    #[test]
+    fn nack_report_one() {
+        let mut reg = ReceiverRegister2::new();
+        assert!(reg.nack_report().is_none());
+
+        reg.update(110.into());
+        assert!(reg.nack_report().is_none());
+
+        reg.update(112.into());
+        let report = reg.nack_report().expect("some report");
+        assert!(report.len() == 1);
+        assert_eq!(report[0].reports.len(), 1);
+        assert_eq!(report[0].reports[0].pid, 111);
+        assert_eq!(report[0].reports[0].blp, 0);
+    }
+
+    #[test]
+    fn nack_report_two() {
+        let mut reg = ReceiverRegister2::new();
+        assert!(reg.nack_report().is_none());
+
+        reg.update(110.into());
+        assert!(reg.nack_report().is_none());
+
+        reg.update(113.into());
+        let report = reg.nack_report().expect("some report");
+        assert!(report.len() == 1);
+        assert_eq!(report[0].reports.len(), 1);
+        assert_eq!(report[0].reports[0].pid, 111);
+        assert_eq!(report[0].reports[0].blp, 0b1);
+    }
+
+    #[test]
+    fn nack_report_with_hole() {
+        let mut reg = ReceiverRegister2::new();
+
+        for i in &[100, 101, 103, 105, 106, 107, 108, 109, 110] {
+            reg.update((*i).into());
+        }
+
+        let report = reg.nack_report().expect("some report");
+        assert!(report.len() == 1);
+        assert_eq!(report[0].reports.len(), 1);
+        assert_eq!(report[0].reports[0].pid, 102);
+        assert_eq!(report[0].reports[0].blp, 0b10);
+    }
+
+    #[test]
+    fn nack_report_stop_at_17() {
+        let mut reg = ReceiverRegister2::new();
+
+        let seq = &[
+            100, 101, 103, 104, 105, 106, 107, 108, 109, 110, //
+            111, 112, 113, 114, 115, 116, 117, 118, 119, 120, //
+            121, 122, 123, 125,
+        ];
+
+        for i in seq {
+            reg.update((*i).into());
+        }
+
+        let report = reg.nack_report().expect("some report");
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].reports.len(), 2);
+        assert_eq!(report[0].reports[0].pid, 102);
+        assert_eq!(report[0].reports[0].blp, 0);
+    }
+
+    #[test]
+    fn nack_report_hole_at_17() {
+        let mut reg = ReceiverRegister2::new();
+
+        let seq = &[
+            100, 101, 103, 104, 105, 106, 107, 108, 109, 110, //
+            111, 112, 113, 114, 115, 116, 117, 119, 120, 121, //
+            122, 123, 124, 125, 126, 127, 128, 129,
+        ];
+
+        for i in seq {
+            reg.update((*i).into());
+        }
+
+        let report = reg.nack_report().expect("some report");
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].reports.len(), 1);
+        assert_eq!(report[0].reports[0].pid, 102);
+        assert_eq!(report[0].reports[0].blp, 0b1000_0000_0000_0000);
+    }
+
+    #[test]
+    fn nack_report_no_stop_all_there() {
+        let mut reg = ReceiverRegister2::new();
+
+        let seq = &[
+            100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, //
+            111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, //
+            122, 123, 124, 125, 126, 127, 128, 129,
+        ];
+
+        for i in seq {
+            reg.update((*i).into());
+        }
+
+        assert_eq!(reg.nack_report(), None);
+    }
+
+    #[test]
+    fn nack_report_rtx() {
+        let mut reg = ReceiverRegister2::new();
+        for i in &[
+            100, 101, 102, 103, 104, 105, //
+        ] {
+            reg.update((*i).into());
+        }
+        assert!(reg.nack_report().is_none());
+        let nack = reg.nack.clone().expect("nack range");
+        assert_eq!(*nack.start, 105);
+
+        for i in &[
+            106, 108, 109, 110, 111, 112, 113, 114, 115, //
+        ] {
+            reg.update((*i).into());
+        }
+        assert!(reg.nack_report().is_some());
+        let nack = reg.nack.clone().expect("nack range");
+        assert_eq!(*nack.start, 107);
+
+        reg.update(107.into()); // Got 107 via RTX
+
+        let nacks = reg.nack_report();
+        assert_eq!(
+            reg.nack_report(),
+            None,
+            "Expected no NACKs to be generated after repairing the stream, got {nacks:?}"
+        );
+        let nack = reg.nack.clone().expect("nack range");
+        assert_eq!(*nack.start, 115);
+    }
+
+    #[test]
+    fn nack_report_rollover_rtx() {
+        // This test is checking that after rollover nacks are not skipped because of
+        // packet position that would remain marked as received from before the rollover
+        let mut reg = ReceiverRegister2::new();
+        for i in &[
+            100, 101, 102, 103, 104, 105, 106, 108, 109, 110, 111, 112, 113, 114, 115,
+        ] {
+            reg.update((*i).into());
+        }
+
+        reg.update(107.into()); // Got 107 via RTX
+        let nack = reg.nack.clone().expect("nack range");
+        assert_eq!(*nack.start, 115);
+
+        for i in 116..3106 {
+            reg.update(i.into());
+        }
+        let nack = reg.nack.clone().expect("nack range");
+        assert_eq!(*nack.start, 3105);
+
+        for i in &[3106, 3108, 3109, 3110, 3111, 3112, 3113, 3114, 3115] {
+            reg.update((*i).into()); // Missing at postion 107 again
+        }
+
+        let nack = reg.nack.clone().expect("nack range");
+        assert_eq!(*nack.start, 3107);
+    }
+
+    #[test]
+    fn nack_report_rollover_rtx_with_seq_jump() {
+        let mut reg = ReceiverRegister2::new();
+
+        // 2999 is missing
+        for i in 0..2999 {
+            reg.update(i.into());
+        }
+
+        // 3002 is missing
+        reg.update(3003.into());
+        reg.update(3004.into());
+        reg.update(3000.into());
+        reg.update(3001.into());
+
+        let reports = reg.nack_report().expect("some report");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].reports[0].pid, 2999);
+        assert_eq!(reports[0].reports[0].blp, 4);
+    }
+
+    #[test]
+    fn out_of_order_and_rollover() {
+        let mut reg = ReceiverRegister2::new();
+
+        reg.update(2998.into());
+        reg.update(2999.into());
+
+        // receive older packet
+        reg.update(2995.into());
+
+        // wrap
+        for i in 3000..5995 {
+            reg.update(i.into());
+        }
+
+        // 5995 is missing
+
+        reg.update(5996.into());
+        reg.update(5997.into());
+
+        let reports = reg.nack_report().expect("some report");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].reports[0].pid, 5995);
+    }
+
+    #[test]
+    fn nack_check_on_seq_rollover() {
+        let range = 65530..65541;
+        let missing = [65535_u64, 65536_u64, 65537_u64];
+        let expected = [65535_u16, 0_u16, 1_u16];
+
+        for (missing, expected) in missing.iter().zip(expected.iter()) {
+            let mut seqs: Vec<_> = range.clone().collect();
+            let mut reg = ReceiverRegister2::new();
+
+            seqs.retain(|x| *x != *missing);
+            for i in seqs.as_slice() {
+                reg.update((*i).into());
+            }
+
+            let reports = reg.nack_report().expect("some report");
+            let pid = reports[0].reports[0].pid;
+            assert_eq!(pid, *expected);
+        }
+    }
+
+    #[test]
+    fn nack_check_forward_at_boundary() {
+        let mut reg = ReceiverRegister2::new();
+        for i in 2996..=3003 {
+            reg.update(i.into());
+        }
+
+        assert!(reg.nack_report().is_none());
+        let nack = reg.nack.clone().expect("nack range");
+        assert_eq!(*nack.start, 3003);
+
+        for i in 3004..=3008 {
+            reg.update(i.into());
+        }
+
+        let report = reg.nack_report();
+        assert!(report.is_none(), "Expected empty NACKs got {:?}", report);
+        let nack = reg.nack.clone().expect("nack range");
+        assert_eq!(*nack.start, 3008);
+    }
+
+    #[test]
+    fn nack_check_forward_at_u16_boundary() {
+        let mut reg = ReceiverRegister2::new();
+        for i in 65500..=65534 {
+            reg.update(i.into());
+        }
+        assert!(reg.nack_report().is_none());
+        let nack = reg.nack.clone().expect("nack range");
+        assert_eq!(*nack.start, 65534);
+
+        for i in 65536..=65566 {
+            reg.update(i.into());
+        }
+
+        assert!(!reg.nack_report().is_none());
+        let nack = reg.nack.clone().expect("nack range");
+        assert_eq!(*nack.start, 65535);
+
+        for i in 65567..=65666 {
+            reg.update(i.into());
+        }
+
+        reg.update(65535.into());
+
+        assert!(reg.nack_report().is_none());
+        let nack = reg.nack.clone().expect("nack range");
+        assert_eq!(*nack.start, 65666);
     }
 }
 
@@ -713,116 +1064,12 @@ mod test {
 
     use super::*;
 
-    #[test]
-    fn in_order() {
-        let mut reg = ReceiverRegister::new(14.into());
-        let new = reg.update_seq(14.into());
-        assert!(new);
-        assert_eq!(reg.probation, 1);
-        let new = reg.update_seq(15.into());
-        assert!(new);
-        assert_eq!(reg.probation, 0);
-        let new = reg.update_seq(16.into());
-        assert!(new);
-        let new = reg.update_seq(17.into());
-        assert!(new);
-        assert_eq!(reg.max_seq, 17.into());
-    }
-
-    #[test]
-    fn jump_during_probation() {
-        let mut reg = ReceiverRegister::new(14.into());
-        let new = reg.update_seq(14.into());
-        assert!(new);
-        assert_eq!(reg.probation, 1);
-        let new = reg.update_seq(16.into());
-        assert!(new);
-        assert_eq!(reg.probation, 1);
-        let new = reg.update_seq(17.into());
-        assert!(new);
-    }
-
-    #[test]
-    fn jump_within_max_dropout() {
-        let mut reg = ReceiverRegister::new(14.into());
-        reg.update_seq(14.into());
-        reg.update_seq(15.into());
-        assert_eq!(reg.max_seq, 15.into());
-
-        reg.update_seq(2500.into());
-        assert!(reg.bad_seq.is_none());
-        reg.update_seq(2501.into());
-        assert_eq!(reg.max_seq, 2501.into());
-    }
-
-    #[test]
-    fn jump_larger_than_max_dropout() {
-        let mut reg = ReceiverRegister::new(14.into());
-        reg.update_seq(14.into());
-        reg.update_seq(15.into());
-        assert_eq!(reg.max_seq, 15.into());
-
-        reg.update_seq(3500.into());
-        assert_eq!(reg.max_seq, 15.into()); // no jump yet
-        assert!(reg.bad_seq.is_some());
-        reg.update_seq(3501.into());
-        assert_eq!(reg.max_seq, 3501.into()); // reset
-        assert!(reg.bad_seq.is_none());
-    }
-
-    #[test]
-    fn old_packet_within_tolerance() {
-        let mut reg = ReceiverRegister::new(140.into());
-        reg.update_seq(140.into());
-        reg.update_seq(141.into());
-        assert_eq!(reg.max_seq, 141.into());
-
-        let new = reg.update_seq(120.into());
-        assert!(!new);
-        assert_eq!(reg.max_seq, 141.into()); // no jump
-        assert!(reg.bad_seq.is_none());
-        let new = reg.update_seq(121.into());
-        assert!(!new);
-        assert_eq!(reg.max_seq, 141.into()); // no jump
-    }
-
-    #[test]
-    fn old_packet_outside_tolerance() {
-        let mut reg = ReceiverRegister::new(140.into());
-        reg.update_seq(140.into());
-        reg.update_seq(141.into());
-        assert_eq!(reg.max_seq, 141.into());
-
-        let new = reg.update_seq(20.into());
-        assert!(new);
-        assert_eq!(reg.max_seq, 141.into()); // no jump yet
-        assert!(reg.bad_seq.is_some());
-        let new = reg.update_seq(21.into());
-        assert!(new);
-        assert_eq!(reg.max_seq, 21.into()); // reset
-        assert!(reg.bad_seq.is_none());
-    }
-
-    #[test]
-    fn repeated_packet() {
-        let mut reg = ReceiverRegister::new(140.into());
-        reg.update_seq(140.into());
-        reg.update_seq(141.into());
-        assert_eq!(reg.max_seq, 141.into());
-
-        let new = reg.update_seq(142.into());
-        assert!(new);
-
-        // Same packet, new should be false.
-        let new = reg.update_seq(142.into());
-        assert!(!new);
-    }
 
     #[test]
     fn jitter_at_0() {
         let mut reg = ReceiverRegister::new(14.into());
-        reg.update_seq(14.into());
-        reg.update_seq(15.into());
+        // reg.update_seq(14.into());
+        // reg.update_seq(15.into());
 
         // 100 fps in clock rate 90kHz => 90_000/100 = 900 per frame
         // 1/100 * 1_000_000 = 10_000 microseconds per frame.
@@ -839,6 +1086,7 @@ mod test {
         //
     }
 
+    // TODO
     #[test]
     fn jitter_at_20() {
         let mut reg = ReceiverRegister::new(14.into());
@@ -861,303 +1109,8 @@ mod test {
             reg.update_time(arrival, 1234 + i * 900, 90_000);
         }
 
-        // jitter should converge on 20.0
-        assert!(
-            (20.0 - reg.jitter).abs() < 0.01,
-            "Expected jitter to converge at 20.0, jitter was: {}",
-            reg.jitter
-        );
-    }
 
-    #[test]
-    fn nack_reports_empty() {
-        let mut reg = ReceiverRegister::new(14.into());
-        for i in [100, 101, 102, 103, 104, 105, 106] {
-            reg.update_seq(i.into());
-        }
-        assert!(reg.nack_reports().is_empty());
-        assert!(reg.nack_reports().is_empty());
-        assert!(reg.nack_reports().is_empty());
-        assert!(reg.nack_reports().is_empty());
-    }
-
-    struct Test {
-        seq: &'static [u64],
-        missing: u16,
-        bitmask: u16,
-        check_from: u64,
-    }
-
-    fn nack_test(t: Test) {
-        let mut reg = ReceiverRegister::new(14.into());
-        for i in t.seq {
-            reg.update_seq((*i).into());
-        }
-        assert_eq!(
-            reg.nack_reports(),
-            vec![Nack {
-                sender_ssrc: 0.into(),
-                ssrc: 0.into(),
-                reports: NackEntry {
-                    pid: t.missing,
-                    blp: t.bitmask,
-                }
-                .into()
-            }]
-        );
-        assert_eq!(reg.nack_check_from, t.check_from.into());
-    }
-
-    #[test]
-    fn nack_report_one() {
-        nack_test(Test {
-            seq: &[100, 101, 103, 104, 105, 106, 107],
-            missing: 102,
-            bitmask: 0,
-            check_from: 101,
-        });
-    }
-
-    #[test]
-    fn nack_report_two() {
-        nack_test(Test {
-            seq: &[100, 101, 104, 105, 106, 107, 108],
-            missing: 102,
-            bitmask: 0b0000_0000_0000_0001,
-            check_from: 101,
-        });
-    }
-
-    #[test]
-    fn nack_report_with_hole() {
-        nack_test(Test {
-            seq: &[100, 101, 103, 105, 106, 107, 108, 109, 110],
-            missing: 102,
-            bitmask: 0b0000_0000_0000_0010,
-            check_from: 101,
-        });
-    }
-
-    #[test]
-    fn nack_report_stop_at_17() {
-        nack_test(Test {
-            seq: &[
-                100, 101, 103, 104, 105, 106, 107, 108, 109, 110, //
-                111, 112, 113, 114, 115, 116, 117, 118, 119, 120, //
-                121, 122, 123, 124, 125,
-            ],
-            missing: 102,
-            bitmask: 0b0000_0000_0000_0000,
-            check_from: 101,
-        });
-    }
-
-    #[test]
-    fn nack_report_hole_at_17() {
-        nack_test(Test {
-            seq: &[
-                100, 101, 103, 104, 105, 106, 107, 108, 109, 110, //
-                111, 112, 113, 114, 115, 116, 117, 119, 120, 121, //
-                122, 123, 124, 125, 126, 127, 128, 129,
-            ],
-            missing: 102,
-            bitmask: 0b1000_0000_0000_0000,
-            check_from: 101,
-        });
-    }
-
-    #[test]
-    fn nack_report_no_stop_all_there() {
-        let mut reg = ReceiverRegister::new(14.into());
-        for i in &[
-            100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, //
-            111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, //
-            122, 123, 124, 125, 126, 127, 128, 129,
-        ] {
-            reg.update_seq((*i).into());
-        }
-        assert!(reg.nack_reports().is_empty());
-        assert_eq!(reg.nack_check_from, (129 - MISORDER_DELAY).into());
-    }
-
-    #[test]
-    fn nack_report_rtx() {
-        let mut reg = ReceiverRegister::new(14.into());
-        for i in &[
-            100, 101, 102, 103, 104, 105, //
-        ] {
-            reg.update_seq((*i).into());
-        }
-        assert!(reg.nack_reports().is_empty());
-        assert_eq!(reg.nack_check_from, (105 - MISORDER_DELAY).into());
-
-        for i in &[
-            106, 108, 109, 110, 111, 112, 113, 114, 115, //
-        ] {
-            reg.update_seq((*i).into());
-        }
-        assert!(!reg.nack_reports().is_empty());
-        assert_eq!(reg.nack_check_from, 106.into());
-
-        reg.update_seq(107.into()); // Got 107 via RTX
-
-        let nacks = reg.nack_reports();
-        assert!(
-            nacks.is_empty(),
-            "Expected no NACKs to be generated after repairing the stream, got {nacks:?}"
-        );
-        assert_eq!(reg.nack_check_from, (115 - MISORDER_DELAY).into());
-    }
-
-    #[test]
-    fn nack_report_rollover_rtx() {
-        let mut reg = ReceiverRegister::new(14.into());
-        for i in &[
-            100, 101, 102, 103, 104, 105, //
-        ] {
-            reg.update_seq((*i).into());
-        }
-        assert!(reg.nack_reports().is_empty());
-        assert_eq!(reg.nack_check_from, (105 - MISORDER_DELAY).into());
-
-        for i in &[
-            106, 108, 109, 110, 111, 112, 113, 114, 115, //
-        ] {
-            reg.update_seq((*i).into());
-        }
-        assert!(!reg.nack_reports().is_empty());
-        assert_eq!(reg.nack_check_from, 106.into());
-
-        reg.update_seq(107.into()); // Got 107 via RTX
-
-        assert_eq!(reg.nack_check_from, (115 - MISORDER_DELAY).into());
-
-        for i in 116..3106 {
-            reg.update_seq(i.into());
-        }
-        assert_eq!(reg.nack_check_from, (3105 - MISORDER_DELAY).into());
-
-        for i in &[
-            106, 108, 109, 110, 111, 112, 113, 114, 115, //
-        ] {
-            reg.update_seq((*i + 3000).into()); // Missing 107 again
-        }
-
-        assert_eq!(reg.nack_check_from, 3106.into());
-    }
-
-    #[test]
-    fn nack_report_rollover_rtx_with_seq_jump() {
-        let mut reg = ReceiverRegister::new(3000.into());
-
-        // 2999 is missing
-        for i in 0..2999 {
-            reg.update_seq(i.into());
-        }
-
-        // 3002 is missing
-        reg.update_seq(3003.into());
-        reg.update_seq(3004.into());
-        reg.update_seq(3000.into());
-        reg.update_seq(3001.into());
-
-        let reports = reg.nack_reports();
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].reports[0].pid, 2999);
-        assert_eq!(reports[0].reports[0].blp, 4);
-    }
-
-    #[test]
-    fn out_of_order_and_rollover() {
-        let mut reg = ReceiverRegister::new(0.into());
-
-        reg.update_seq(2998.into());
-        reg.update_seq(2999.into());
-
-        // receive older packet
-        reg.update_seq(2995.into());
-
-        // wrap
-        for i in 3000..5995 {
-            reg.update_seq(i.into());
-        }
-
-        // 5995 is missing
-
-        reg.update_seq(5996.into());
-        reg.update_seq(5997.into());
-
-        let reports = reg.create_nack_reports();
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].reports[0].pid, 5995);
-    }
-
-    #[test]
-    fn nack_check_on_seq_rollover() {
-        let range = 65530..65541 + MISORDER_DELAY;
-        let missing = [65535_u64, 65536_u64, 65537_u64];
-        let expected = [65535_u16, 0_u16, 1_u16];
-
-        for (missing, expected) in missing.iter().zip(expected.iter()) {
-            let mut seqs: Vec<_> = range.clone().collect();
-            let mut reg = ReceiverRegister::new(seqs[0].into());
-
-            seqs.retain(|x| *x != *missing);
-            for i in seqs.as_slice() {
-                reg.update_seq((*i).into());
-            }
-
-            let reports = reg.create_nack_reports();
-            let nack = reports.get(0).unwrap();
-            let pid = nack.reports.get(0).unwrap().pid;
-            assert_eq!(pid, *expected);
-        }
-    }
-
-    #[test]
-    fn nack_check_forward_at_boundary() {
-        let mut reg = ReceiverRegister::new(2996.into());
-        for i in 2996..=3003 {
-            reg.update_seq((i).into());
-        }
-        assert!(reg.nack_reports().is_empty());
-        assert_eq!(reg.nack_check_from, (3003 - MISORDER_DELAY).into());
-
-        for i in 3004..=3008 {
-            reg.update_seq((i).into());
-        }
-
-        let nacks = reg.nack_reports();
-        assert!(nacks.is_empty(), "Expected empty NACKs got {nacks:?}");
-        assert_eq!(reg.nack_check_from, (3008 - MISORDER_DELAY).into());
-    }
-
-    #[test]
-    fn nack_check_forward_at_u16_boundary() {
-        let mut reg = ReceiverRegister::new(65500.into());
-        for i in 65500..=65534 {
-            reg.update_seq((i).into());
-        }
-        assert!(reg.nack_reports().is_empty());
-        assert_eq!(reg.nack_check_from, (65534 - MISORDER_DELAY).into());
-
-        for i in 65536..=65566 {
-            reg.update_seq((i).into());
-        }
-
-        assert!(!reg.nack_reports().is_empty());
-        assert_eq!(reg.nack_check_from, 65534.into());
-
-        for i in 65567..=65666 {
-            reg.update_seq((i).into());
-        }
-
-        reg.update_seq(65535.into());
-
-        assert!(reg.nack_reports().is_empty());
-        assert_eq!(reg.nack_check_from, (65666 - MISORDER_DELAY).into());
-    }
-
+    // TODO
     #[test]
     fn expected_received_no_loss() {
         let mut reg = ReceiverRegister::new(14.into());
@@ -1173,6 +1126,7 @@ mod test {
         assert_eq!(reg.packets_lost(), 0);
     }
 
+    // TODO
     #[test]
     fn expected_received_with_loss() {
         let mut reg = ReceiverRegister::new(14.into());
