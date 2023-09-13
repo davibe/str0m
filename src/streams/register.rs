@@ -19,7 +19,7 @@ const MAX_NACKS: u8 = 5;
 #[derive(Debug)]
 pub struct ReceiverRegister2 {
     /// Status of packets indexed by wrapping SeqNo.
-    packet_status: Vec<PacketStatus>,
+    packets: Vec<PacketStatus>,
 
     /// Range of seq numbers considered NACK reporting.
     nack: Option<Range<SeqNo>>,
@@ -28,7 +28,7 @@ pub struct ReceiverRegister2 {
 impl ReceiverRegister2 {
     pub fn new() -> Self {
         ReceiverRegister2 {
-            packet_status: vec![PacketStatus::default(); MAX_DROPOUT as usize],
+            packets: vec![PacketStatus::default(); MAX_DROPOUT as usize],
             nack: None,
         }
     }
@@ -37,6 +37,7 @@ impl ReceiverRegister2 {
         let Some(nack) = self.nack.clone() else {
             // automatically pick up the first seq number
             self.nack = Some(seq..seq);
+            self.packet(seq).mark_received();
             return true;
         };
 
@@ -45,9 +46,7 @@ impl ReceiverRegister2 {
             return false;
         }
 
-        let mut next_nack = nack.clone();
-
-        next_nack.end = next_nack.end.max(seq);
+        let mut next_nack = nack.start..nack.end.max(seq);
 
         let new = self.packet(seq).mark_received();
 
@@ -77,33 +76,108 @@ impl ReceiverRegister2 {
         new
     }
 
-    fn as_index(&self, seq: u64) -> usize {
-        (seq % self.packet_status.len() as u64) as usize
+    fn as_index(&self, seq: SeqNo) -> usize {
+        (*seq % self.packets.len() as u64) as usize
     }
 
     fn packet(&mut self, seq: SeqNo) -> &mut PacketStatus {
-        let index = self.as_index(*seq);
-        &mut self.packet_status[index]
+        let index = self.as_index(seq);
+        &mut self.packets[index]
     }
 }
 
 #[cfg(test)]
 mod nack_test {
+    use std::ops::Range;
+
+    use crate::{
+        rtp_::SeqNo,
+        streams::register::{ReceiverRegister2, MAX_MISORDER},
+    };
+
+    fn assert_update(
+        reg: &mut ReceiverRegister2,
+        seq: u64,
+        expect_received: bool,
+        expect_new: bool,
+        expect_nack: Range<u64>,
+    ) {
+        assert_eq!(
+            reg.update(seq.into()),
+            expect_new,
+            "seq {} was expected to{} be new",
+            seq,
+            if expect_new { "" } else { " NOT" }
+        );
+        let nack = reg.nack.clone().expect("nack range");
+        assert_eq!(
+            reg.packet(seq.into()).received,
+            expect_received,
+            "seq {} expected to{} be received in {:?}",
+            seq,
+            if expect_received { "" } else { " NOT" },
+            nack
+        );
+        assert_eq!(nack, expect_nack.start.into()..expect_nack.end.into());
+        assert_not_dirty(reg);
+    }
+
+    fn assert_not_dirty(reg: &ReceiverRegister2) {
+        // we should leave no dirty state outside of the nack window
+        let nack = reg.nack.clone().expect("nack range");
+        let nack = (*nack.start..=*nack.end)
+            .map(|seq| reg.as_index(seq.into()))
+            .collect::<Vec<_>>();
+
+        for i in 0..reg.packets.len() {
+            if nack.contains(&i) {
+                continue;
+            }
+            assert_eq!(
+                reg.packets[i].received || reg.packets[i].nack_count != 0,
+                false,
+                "dirty state at index {} outside of nack window {:?}",
+                i,
+                nack,
+            );
+        }
+    }
 
     #[test]
-    fn in_order() {
+    fn nack_window_sliding() {
         let mut reg = ReceiverRegister2::new();
-        let new = reg.update_seq(14.into());
-        assert!(new);
-        assert_eq!(reg.probation, 1);
-        let new = reg.update_seq(15.into());
-        assert!(new);
-        assert_eq!(reg.probation, 0);
-        let new = reg.update_seq(16.into());
-        assert!(new);
-        let new = reg.update_seq(17.into());
-        assert!(new);
-        assert_eq!(reg.max_seq, 17.into());
+
+        assert_update(&mut reg, 10, true, true, 10..10);
+
+        // packet before window start is ignored
+        assert_update(&mut reg, 9, false, false, 10..10);
+
+        // duped packet
+        assert_update(&mut reg, 10, true, false, 10..10);
+
+        // future packets accepted, window not sliding
+        let next = 10 + MAX_MISORDER;
+        assert_update(&mut reg, next, true, true, 11..next);
+        let next = 11 + MAX_MISORDER;
+        assert_update(&mut reg, next, true, true, 11..next);
+
+        // future packet accepted, sliding window
+        let next = 12 + MAX_MISORDER;
+        assert_update(&mut reg, next, true, true, 12..next);
+        assert_eq!(reg.packet(11.into()).received, false);
+
+        // older packet received within window
+        let next = 13;
+        assert_update(&mut reg, next, true, true, 12..(12 + MAX_MISORDER));
+
+        // future packet accepted, sliding window start skips over received
+        let next = 13 + MAX_MISORDER;
+        assert_update(&mut reg, next, true, true, 14..next);
+        assert_eq!(reg.packet(11.into()).received, false);
+
+        // older packet accepted, window star moves ahead
+        let next = 14;
+        assert_update(&mut reg, next, false, true, 15..(13 + MAX_MISORDER));
     }
 }
 
