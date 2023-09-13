@@ -1,11 +1,114 @@
-use std::time::Instant;
+use std::{ops::Range, time::Instant};
 
 use crate::rtp_::{Nack, NackEntry, ReceptionReport, ReportList, SeqNo};
 
+/// How many sequence numbers we keep track of
 const MAX_DROPOUT: u64 = 3000;
+
+/// Number of out of order packets we keep track of for reports
+/// A suggested maximum value min is MAX_DROPOUT / 2
 const MAX_MISORDER: u64 = 100;
-const MIN_SEQUENTIAL: u64 = 2;
+
+/// Limits the reporting of missing packet up to max_seq - MISORDER_DELAY.
+/// This is to avoid reporting packets that are likely to arrive soon because of very small jitter.
 const MISORDER_DELAY: u64 = 1;
+
+/// The max number of NACKs we perform for a single packet
+const MAX_NACKS: u8 = 5;
+
+#[derive(Debug)]
+pub struct ReceiverRegister2 {
+    /// Status of packets indexed by wrapping SeqNo.
+    packet_status: Vec<PacketStatus>,
+
+    /// Range of seq numbers considered NACK reporting.
+    nack: Option<Range<SeqNo>>,
+}
+
+impl ReceiverRegister2 {
+    pub fn new() -> Self {
+        ReceiverRegister2 {
+            packet_status: vec![PacketStatus::default(); MAX_DROPOUT as usize],
+            nack: None,
+        }
+    }
+
+    pub fn update(&mut self, seq: SeqNo) -> bool {
+        if self.nack.is_none() {
+            // automatically pick up the first seq number
+            self.nack = Some(seq..seq);
+            return true;
+        }
+        let nack = self.nack.clone().expect("active nack range");
+
+        if seq < nack.start {
+            // skip old seq numbers, report as not new
+            return false;
+        }
+
+        let mut next_nack = nack.clone();
+
+        next_nack.end = next_nack.end.max(seq);
+
+        let new = self.packet(seq).mark_received();
+
+        next_nack.start = {
+            let min = next_nack.end.saturating_sub(MAX_MISORDER);
+            let mut start = (*next_nack.start).max(min);
+            while start < *next_nack.end {
+                if !self.packet(start.into()).received {
+                    break;
+                }
+                start += 1;
+            }
+            start.into()
+        };
+
+        // reset packets that are rolling our of the nack window
+        for s in *nack.start..*next_nack.start {
+            let p = self.packet(s.into());
+            if !p.received {
+                debug!("Seq no {} missing after {} attempts", seq, p.nack_count);
+            }
+            self.packet(s.into()).reset();
+        }
+
+        self.nack = Some(next_nack);
+
+        new
+    }
+
+    fn as_index(&self, seq: u64) -> usize {
+        (seq % self.packet_status.len() as u64) as usize
+    }
+
+    fn packet(&mut self, seq: SeqNo) -> &mut PacketStatus {
+        let index = self.as_index(*seq);
+        &mut self.packet_status[index]
+    }
+}
+
+#[cfg(test)]
+mod nack_test {
+
+    #[test]
+    fn in_order() {
+        let mut reg = ReceiverRegister2::new();
+        let new = reg.update_seq(14.into());
+        assert!(new);
+        assert_eq!(reg.probation, 1);
+        let new = reg.update_seq(15.into());
+        assert!(new);
+        assert_eq!(reg.probation, 0);
+        let new = reg.update_seq(16.into());
+        assert!(new);
+        let new = reg.update_seq(17.into());
+        assert!(new);
+        assert_eq!(reg.max_seq, 17.into());
+    }
+}
+
+const MIN_SEQUENTIAL: u64 = 2;
 
 #[derive(Debug)]
 pub struct ReceiverRegister {
@@ -508,9 +611,6 @@ impl TimePoint {
     }
 }
 
-/// The max number of NACKs we perform for a single packet:
-const MAX_NACKS: u8 = 5;
-
 #[derive(Debug, Default, Clone, Copy)]
 struct PacketStatus {
     received: bool,
@@ -520,6 +620,17 @@ struct PacketStatus {
 impl PacketStatus {
     fn should_nack(&self) -> bool {
         !self.received && self.nack_count < MAX_NACKS
+    }
+
+    fn mark_received(&mut self) -> bool {
+        let new = !self.received;
+        self.received = true;
+        new
+    }
+
+    fn reset(&mut self) {
+        self.received = false;
+        self.nack_count = 0;
     }
 }
 
