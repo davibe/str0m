@@ -58,6 +58,7 @@ impl From<CryptoError> for RtpError {
             #[cfg(feature = "openssl")]
             CryptoError::OpenSsl(e) => RtpError::OpenSsl(e),
             CryptoError::Io(e) => RtpError::Io(e),
+            CryptoError::AesGcm => RtpError::ParseHeader,
         }
     }
 }

@@ -45,4 +45,7 @@ pub enum CryptoError {
     /// Other IO errors.
     #[error("{0}")]
     Io(#[from] io::Error),
+    
+    #[error("AesGcmError")]
+    AesGcm,
 }

@@ -18,6 +18,10 @@ pub enum DtlsError {
     /// Other IO errors.
     #[error("{0}")]
     Io(#[from] io::Error),
+    
+    /// TMP
+    #[error("AesGcmError")]
+    AesGcm,
 }
 
 impl DtlsError {
@@ -37,6 +41,7 @@ impl From<CryptoError> for DtlsError {
             #[cfg(feature = "openssl")]
             CryptoError::OpenSsl(e) => DtlsError::OpenSsl(e),
             CryptoError::Io(e) => DtlsError::Io(e),
+            CryptoError::AesGcm => DtlsError::AesGcm,
         }
     }
 }
