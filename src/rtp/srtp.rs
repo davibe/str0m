@@ -891,7 +891,6 @@ mod test {
             assert_eq!(decrypted, rfc7714::PLAINTEXT_RTP_PACKET[12..]);
         }
 
-        #[test]
         fn unprotect_rtp_should_fail_with_broken_tag_data() {
             let mut context = make_rtp_context();
 
