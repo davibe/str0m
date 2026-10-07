@@ -257,8 +257,8 @@ impl<'a> SdpApi<'a> {
     /// the mid been advertised via [`Event::MediaAdded`][crate::Event::MediaAdded].
     ///
     /// * `stream_id` is used to synchronize media. It is `a=msid-semantic: WMS <streamId>` line in SDP.
-    /// * `track_id` is becomes both the track id in `a=msid <streamId> <trackId>` as well as the
-    ///   CNAME in the RTP SDES.
+    /// * `track_id` becomes the track id in `a=msid <streamId> <trackId>`.
+    ///   Tracks in the same stream share the RTP SDES CNAME for synchronization.
     ///
     /// ```
     /// # #[cfg(feature = "openssl")] {
@@ -319,6 +319,7 @@ impl<'a> SdpApi<'a> {
         }
 
         // TODO: let user configure stream/track name.
+        let cname = stream_id.clone();
         let msid = Msid {
             stream_id,
             track_id: track_id.clone(),
@@ -326,7 +327,7 @@ impl<'a> SdpApi<'a> {
 
         let add = AddMedia {
             mid,
-            cname: track_id,
+            cname,
             msid,
             kind,
             dir,
@@ -1869,6 +1870,38 @@ mod test {
 
     fn get_setup_from_media_line(line: &MediaLine) -> Setup {
         line.setup().expect("Expected a=setup attribute in SDP")
+    }
+
+    #[test]
+    fn tracks_in_one_stream_keep_shared_cname_and_distinct_track_ids() {
+        let now = Instant::now();
+        let mut offerer = Rtc::new(now);
+        let mut answerer = Rtc::new(now);
+        let mut changes = offerer.sdp_api();
+        let audio = changes.add_media(
+            MediaKind::Audio,
+            Direction::SendOnly,
+            Some("replay".into()),
+            None,
+            None,
+        );
+        let video = changes.add_media(
+            MediaKind::Video,
+            Direction::SendOnly,
+            Some("replay".into()),
+            None,
+            None,
+        );
+        let (offer, pending) = changes.apply().unwrap();
+        let sdp = offer.to_sdp_string();
+        assert_eq!(sdp.matches("cname:replay").count(), 3);
+        let answer = answerer.sdp_api().accept_offer(offer).unwrap();
+        offerer.sdp_api().accept_answer(pending, answer).unwrap();
+        let audio = offerer.media(audio).unwrap();
+        let video = offerer.media(video).unwrap();
+        assert_eq!(audio.cname(), video.cname());
+        assert_eq!(audio.stream_id(), video.stream_id());
+        assert_ne!(audio.track_id(), video.track_id());
     }
 
     /// RFC 8842 §5.2: an offer MUST use a=setup:actpass regardless of DTLS role.
