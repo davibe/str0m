@@ -40,7 +40,7 @@ const MIN_TIME_BETWEEN_STAGNANT_PROBES: Duration = Duration::from_secs(15);
 /// Threshold for considering an estimate change significant (5%).
 const ESTIMATE_CHANGE_THRESHOLD: f64 = 0.05;
 
-/// Probe rate scale for stagnation probes (2× current estimate).
+/// Probe rate scale for stagnation probes (2× desired bitrate).
 const STAGNANT_PROBE_SCALE: f64 = 2.0;
 
 /// WebRTC's `BandwidthLimitedCause` (subset used by probing gating).
@@ -61,7 +61,7 @@ pub struct ProbeControl {
     prev_desired: Option<Bitrate>,
 
     last_estimate: Option<Bitrate>,
-    last_estimate_change: Option<Instant>,
+    last_estimate_progress: Option<(Instant, Bitrate)>,
     last_cause: BandwidthLimitedCause,
 
     prev_estimate: Option<Bitrate>,
@@ -72,8 +72,6 @@ pub struct ProbeControl {
     last_probe: Option<LastProbe>,
 
     large_drop: Option<LargeDrop>,
-
-    last_stagnant: Option<Instant>,
 
     next_cluster_id: TwccClusterId,
     pending: VecDeque<ProbeClusterConfig>,
@@ -105,7 +103,7 @@ impl Default for ProbeControl {
             desired_bitrate: None,
             prev_desired: None,
             last_estimate: None,
-            last_estimate_change: None,
+            last_estimate_progress: None,
             last_cause: BandwidthLimitedCause::DelayBasedLimited,
             prev_estimate: None,
             alr_start: None,
@@ -113,7 +111,6 @@ impl Default for ProbeControl {
             next_cluster_id: 0.into(),
             last_probe: None,
             large_drop: None,
-            last_stagnant: None,
             pending: VecDeque::new(),
             scheduled_exponential: None,
             scheduled_periodic_alr: None,
@@ -136,8 +133,7 @@ impl ProbeControl {
             self.pending.clear();
             self.last_estimate = None;
             self.desired_bitrate = None;
-            self.last_estimate_change = None;
-            self.last_stagnant = None;
+            self.last_estimate_progress = None;
             self.last_probe = None;
             self.prev_estimate = None;
             self.scheduled_exponential = None;
@@ -238,6 +234,8 @@ impl ProbeControl {
             return None;
         }
 
+        self.update_estimate_progress(now, estimate);
+
         // Try each probe type in order - only one fires per timeout.
         let _ = self.maybe_initial(now, desired, estimate)
             || self.maybe_exponential(now, desired, estimate)
@@ -246,9 +244,7 @@ impl ProbeControl {
             || self.maybe_periodic_alr(now, desired)
             || self.maybe_stagnant(now, desired, estimate);
 
-        self.update_estimate_change(now, estimate);
-
-        // Update prev_estimate for next cycle (used by large drop and stagnation detection).
+        // Update prev_estimate for large-drop detection in the next cycle.
         self.prev_estimate = Some(estimate);
 
         // Update timeout based on current state.
@@ -261,17 +257,11 @@ impl ProbeControl {
         self.pending.pop_front()
     }
 
-    fn update_estimate_change(&mut self, now: Instant, estimate: Bitrate) {
-        // Track when estimate last changed significantly (>5%).
-        if let Some(prev) = self.prev_estimate {
-            if estimate != prev {
-                self.last_estimate_change = Some(now);
-            }
-        }
-
-        // Initialize baseline if not set yet.
-        if self.last_estimate_change.is_none() {
-            self.last_estimate_change = Some(now);
+    fn update_estimate_progress(&mut self, now: Instant, estimate: Bitrate) {
+        // Oscillation below a high-water mark does not demonstrate recovery.
+        let (_, highest) = self.last_estimate_progress.get_or_insert((now, estimate));
+        if estimate > *highest * (1.0 + ESTIMATE_CHANGE_THRESHOLD) {
+            self.last_estimate_progress = Some((now, estimate));
         }
     }
 
@@ -395,7 +385,7 @@ impl ProbeControl {
         true
     }
 
-    /// Probe when estimate has stagnated (no change for 15+ seconds) despite unmet demand.
+    /// Probe after 15 seconds without upward progress despite unmet demand.
     ///
     /// ## Why This Exists (str0m Addition)
     ///
@@ -439,7 +429,7 @@ impl ProbeControl {
     /// - Catches deadlock regardless of whether a drop was detected
     /// - Provides periodic escape from any stagnation scenario, not just post-drop
     /// - Uses a conservative 15-second wait to avoid probing at convergence
-    /// - Rate-limited to once per 30 seconds to prevent oscillation
+    /// - Waits at least 15 seconds after any probe to prevent excessive probing
     fn maybe_stagnant(&mut self, now: Instant, desired: Bitrate, estimate: Bitrate) -> bool {
         // Don't interfere with initial probing phase.
         if self.is_during_initial(now) {
@@ -451,11 +441,11 @@ impl ProbeControl {
             return false;
         }
 
-        let Some(last_change) = self.last_estimate_change else {
+        let Some((last_progress, _)) = self.last_estimate_progress else {
             return false;
         };
 
-        if now.saturating_duration_since(last_change) < MIN_TIME_BETWEEN_STAGNANT_PROBES {
+        if now.saturating_duration_since(last_progress) < MIN_TIME_BETWEEN_STAGNANT_PROBES {
             return false;
         }
 
@@ -464,17 +454,16 @@ impl ProbeControl {
             return false;
         }
 
-        // Rate limit: at least 30 seconds between stagnation probes.
-        if let Some(last_probe) = self.last_stagnant {
-            if now.saturating_duration_since(last_probe) < MIN_TIME_BETWEEN_STAGNANT_PROBES {
-                return false;
-            }
+        // A recent probe already tested capacity, including probes made in ALR.
+        if self.time_since_last_probe(now) < MIN_TIME_BETWEEN_STAGNANT_PROBES {
+            return false;
         }
 
-        // Probe at 2× estimate (conservative, won't overwhelm if at capacity).
-        let probe_rate = estimate * STAGNANT_PROBE_SCALE;
+        // Test unmet demand, as periodic ALR probes do. A low estimate can
+        // otherwise keep both media and recovery probes below available capacity.
+        let probe_rate = desired * STAGNANT_PROBE_SCALE;
         self.queue_probe(probe_rate, ProbeKind::Stagnant, desired, now);
-        self.last_stagnant = Some(now);
+        self.last_estimate_progress = Some((now, estimate));
 
         true
     }
@@ -692,6 +681,78 @@ impl BandwidthLimitedCause {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn fluctuating_estimate_does_not_starve_recovery_probes() {
+        let mut pc = ProbeControl::new();
+        let start = Instant::now();
+        pc.enable(true);
+        pc.set_desired_bitrate(Bitrate::mbps(7));
+        pc.set_estimated_bitrate(Bitrate::mbps(1), BandwidthLimitedCause::DelayBasedLimited);
+        assert!(pc.handle_timeout(start).is_some());
+        assert!(pc.handle_timeout(start).is_some());
+
+        let mut probes = Vec::new();
+        for seconds in 1..=60 {
+            let now = start + Duration::from_secs(seconds);
+            let estimate = Bitrate::kbps(if seconds % 2 == 0 { 900 } else { 1100 });
+            pc.set_estimated_bitrate(estimate, BandwidthLimitedCause::DelayBasedLimited);
+            if let Some(probe) = pc.handle_timeout(now) {
+                assert_eq!(probe.target_bitrate(), Bitrate::mbps(14));
+                probes.push(seconds);
+            }
+        }
+
+        assert!(
+            probes.len() >= 3,
+            "Unmet demand must not wait indefinitely: {probes:?}"
+        );
+        assert!(probes.windows(2).all(|p| p[1] - p[0] >= 15));
+    }
+
+    #[test]
+    fn upward_progress_defers_recovery_probe() {
+        let mut pc = ProbeControl::new();
+        let start = Instant::now();
+        pc.enable(true);
+        pc.set_desired_bitrate(Bitrate::mbps(7));
+        pc.set_estimated_bitrate(Bitrate::mbps(1), BandwidthLimitedCause::DelayBasedLimited);
+        assert!(pc.handle_timeout(start).is_some());
+        assert!(pc.handle_timeout(start).is_some());
+
+        for seconds in 1..=30 {
+            let now = start + Duration::from_secs(seconds);
+            let estimate = Bitrate::mbps(1) * 1.02_f64.powi(seconds as i32);
+            pc.set_estimated_bitrate(estimate, BandwidthLimitedCause::DelayBasedLimited);
+            assert!(pc.handle_timeout(now).is_none());
+        }
+    }
+
+    #[test]
+    fn recovery_probe_waits_after_alr_probe() {
+        let mut pc = ProbeControl::new();
+        let start = Instant::now();
+        pc.enable(true);
+        pc.set_desired_bitrate(Bitrate::mbps(7));
+        pc.set_estimated_bitrate(Bitrate::mbps(1), BandwidthLimitedCause::DelayBasedLimited);
+        assert!(pc.handle_timeout(start).is_some());
+        assert!(pc.handle_timeout(start).is_some());
+        assert!(pc.handle_timeout(start + Duration::from_secs(2)).is_none());
+
+        let alr = start + Duration::from_secs(14);
+        pc.set_alr_start_time(alr);
+        assert!(pc.handle_timeout(alr).unwrap().is_alr_probe());
+        pc.set_alr_stop_time(alr + Duration::from_secs(1));
+
+        for seconds in 15..30 {
+            let now = start + Duration::from_secs(seconds);
+            let estimate = Bitrate::kbps(if seconds % 2 == 0 { 900 } else { 1100 });
+            pc.set_estimated_bitrate(estimate, BandwidthLimitedCause::DelayBasedLimited);
+            assert!(pc.handle_timeout(now).is_none());
+        }
+        pc.set_estimated_bitrate(Bitrate::kbps(900), BandwidthLimitedCause::DelayBasedLimited);
+        assert!(pc.handle_timeout(start + Duration::from_secs(30)).is_some());
+    }
 
     #[test]
     fn initial_exponential_probes_are_queued_and_emitted_one_per_tick() {

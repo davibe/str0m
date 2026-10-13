@@ -52,6 +52,7 @@ pub(crate) use probe::ProbeClusterConfig;
 const INITIAL_BITRATE_WINDOW: Duration = Duration::from_millis(500);
 const BITRATE_WINDOW: Duration = Duration::from_millis(150);
 const STARTUP_PHASE: Duration = Duration::from_secs(2);
+const PROBE_DROP_THROUGHPUT_FRACTION: f64 = 0.85;
 
 pub struct Bwe {
     bwe: SendSideBandwidthEstimator,
@@ -221,7 +222,17 @@ impl SendSideBandwidthEstimator {
         let acked_bitrate = self.acked_bitrate_estimator.current_estimate();
 
         // Use the latest probe result from this update, if any
-        let probe_result = latest_probe_result;
+        let probe_result = latest_probe_result.map(|probe| {
+            match (acked_bitrate, self.delay_controller.last_estimate()) {
+                (Some(acked), Some(current)) => {
+                    // A short probe can straddle receive bursts. Limit its backoff to
+                    // measured throughput, leaving room to drain a congested queue.
+                    // Capping the floor at the current estimate prevents an increase.
+                    probe.max(current.min(acked * PROBE_DROP_THROUGHPUT_FRACTION))
+                }
+                _ => probe,
+            }
+        });
 
         let is_probe_result = probe_result.is_some();
 
@@ -482,5 +493,130 @@ impl fmt::Display for BandwidthUsage {
             BandwidthUsage::Normal => write!(f, "normal"),
             BandwidthUsage::Underuse => write!(f, "underuse"),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::bwe_::probe::ProbeKind;
+    use crate::rtp_::TwccPacketId;
+
+    #[test]
+    fn batched_probe_does_not_undercut_acknowledged_throughput() {
+        for initial in [Bitrate::mbps(2), Bitrate::kbps(500)] {
+            check_batched_probe(initial);
+        }
+    }
+
+    #[test]
+    fn startup_probe_can_reduce_estimate_without_throughput_history() {
+        let start = Instant::now();
+        let mut bwe = SendSideBandwidthEstimator::new(Bitrate::mbps(2));
+        let cluster = 1.into();
+        let config = ProbeClusterConfig::new(cluster, Bitrate::mbps(2), ProbeKind::Initial);
+        assert!(bwe.start_probe(config, start));
+
+        let records: Vec<_> = (0..5)
+            .map(|i| {
+                TwccSendRecord::test_new(
+                    TwccPacketId::with_cluster(i, cluster),
+                    start + Duration::from_millis(i * 2),
+                    1200,
+                    start + Duration::from_millis(140),
+                    Some(start + Duration::from_millis(if i < 4 { 20 } else { 100 })),
+                )
+            })
+            .collect();
+        bwe.update(records.iter(), start + Duration::from_millis(140));
+
+        assert!(bwe.acked_bitrate_estimator.current_estimate().is_none());
+        assert_eq!(
+            bwe.delay_controller.last_estimate(),
+            Some(Bitrate::kbps(456))
+        );
+    }
+
+    fn check_batched_probe(initial: Bitrate) {
+        let start = Instant::now();
+        let mut bwe = SendSideBandwidthEstimator::new(initial);
+
+        // An uncongested stream delivers 1.2 Mbit/s before the probe.
+        for batch in 0..25 {
+            let records: Vec<_> = (0..10)
+                .map(|i| {
+                    let seq = batch * 10 + i;
+                    let sent = start + Duration::from_millis(seq * 8);
+                    TwccSendRecord::test_new(
+                        TwccPacketId::new(seq),
+                        sent,
+                        1200,
+                        start + Duration::from_millis((batch + 1) * 80 + 40),
+                        Some(sent + Duration::from_millis(20)),
+                    )
+                })
+                .collect();
+            bwe.update(
+                records.iter(),
+                start + Duration::from_millis((batch + 1) * 80 + 40),
+            );
+        }
+        let acknowledged = bwe.acked_bitrate_estimator.current_estimate().unwrap();
+        assert!(acknowledged >= Bitrate::mbps(1));
+        let before_probe = bwe.delay_controller.last_estimate().unwrap();
+
+        let probe_start = start + Duration::from_millis(2100);
+        let cluster = 1.into();
+        let config = ProbeClusterConfig::new(cluster, Bitrate::mbps(2), ProbeKind::PeriodicAlr);
+        assert!(bwe.start_probe(config, probe_start));
+        // A short probe straddles two delivery bursts 80ms apart, without loss.
+        let records: Vec<_> = (0..5)
+            .map(|i| {
+                TwccSendRecord::test_new(
+                    TwccPacketId::with_cluster(250 + i, cluster),
+                    probe_start + Duration::from_millis(i * 2),
+                    1200,
+                    probe_start + Duration::from_millis(140),
+                    Some(probe_start + Duration::from_millis(if i < 4 { 20 } else { 100 })),
+                )
+            })
+            .collect();
+        bwe.update(records.iter(), probe_start + Duration::from_millis(140));
+
+        let acknowledged = bwe.acked_bitrate_estimator.current_estimate().unwrap();
+        let floor = before_probe.min(acknowledged * 0.85);
+        let estimate = bwe.delay_controller.last_estimate().unwrap();
+        assert!(
+            estimate >= floor,
+            "{estimate} is below proven throughput floor {floor}"
+        );
+        assert!(
+            estimate <= before_probe,
+            "a low probe must not increase the estimate"
+        );
+
+        // A subsequent capacity drop still reduces the estimate through ordinary feedback.
+        let congestion_start = probe_start + Duration::from_millis(200);
+        for batch in 0..20 {
+            let reported = congestion_start + Duration::from_millis((batch + 1) * 240 + 40);
+            let records: Vec<_> = (0..10)
+                .map(|i| {
+                    let index = batch * 10 + i;
+                    TwccSendRecord::test_new(
+                        TwccPacketId::new(255 + index),
+                        congestion_start + Duration::from_millis(index * 8),
+                        1200,
+                        reported,
+                        Some(congestion_start + Duration::from_millis(index * 24 + 20)),
+                    )
+                })
+                .collect();
+            bwe.update(records.iter(), reported);
+        }
+        let congested = bwe.last_estimate().unwrap();
+        assert!(
+            congested < Bitrate::kbps(600),
+            "must back off on a 400 kbit/s link: {congested}"
+        );
     }
 }

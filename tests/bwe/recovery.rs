@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use netem::{DataSize, NetemConfig};
-use str0m::RtcError;
 use str0m::bwe::Bitrate;
+use str0m::{Event, RtcError};
 
 use crate::common::{BweTestContext, Step, connect_with_bwe, init_crypto_default, init_log};
 
@@ -185,6 +185,42 @@ fn aimd_recovery_reaches_original_estimate() -> Result<(), RtcError> {
     let (mut l, mut r) = connect_with_bwe(Bitrate::mbps(2), Bitrate::mbps(5));
     let mut ctx = BweTestContext::new(&mut l, &mut r);
     ctx.run_plan(&mut l, &mut r, &plan)?;
+
+    Ok(())
+}
+
+#[test]
+fn recovery_probes_respect_limited_capacity() -> Result<(), RtcError> {
+    init_log();
+    init_crypto_default();
+
+    let (mut l, mut r) = connect_with_bwe(Bitrate::mbps(1), Bitrate::mbps(7));
+    let config = NetemConfig::new()
+        .latency(Duration::from_millis(20))
+        .link(Bitrate::mbps(1), DataSize::kbytes(100))
+        .seed(42);
+    l.set_netem(config);
+    r.set_netem(config);
+    let mut ctx = BweTestContext::new(&mut l, &mut r);
+    ctx.set_media_send_rate(Bitrate::kbps(750));
+
+    ctx.run_for_duration(&mut l, &mut r, Duration::from_secs(10))?;
+    for _ in 0..60 {
+        let estimate = ctx
+            .run_for_duration(&mut l, &mut r, Duration::from_secs(1))?
+            .expect("bandwidth estimate after warm-up");
+        assert!(
+            estimate <= Bitrate::kbps(1500),
+            "Unmet 7 Mbps demand must not override a 1 Mbps bottleneck: {estimate}"
+        );
+    }
+
+    assert!(
+        l.events.iter().any(|(_, event)| {
+            matches!(event, Event::Probe(probe) if probe.target_bitrate() == Bitrate::mbps(14))
+        }),
+        "The test must exercise a probe toward unmet demand"
+    );
 
     Ok(())
 }
