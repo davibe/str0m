@@ -147,8 +147,6 @@ impl ArrivalGroupAccumulator {
         // Variation between previous group and current.
         let arrival_delta = self.arrival_delta();
         let send_delta = self.send_delta();
-        let last_remote_recv_time = self.current_group.remote_recv_time();
-
         let current_group = mem::take(&mut self.current_group);
         self.previous_group = Some(current_group);
 
@@ -157,7 +155,7 @@ impl ArrivalGroupAccumulator {
         Some(InterGroupDelayDelta {
             send_delta: send_delta?,
             arrival_delta: arrival_delta?,
-            last_remote_recv_time,
+            remote_recv_time: packet.remote_recv_time,
         })
     }
 
@@ -182,8 +180,8 @@ pub struct InterGroupDelayDelta {
     pub send_delta: TimeDelta,
     /// The delta between the remote arrival times of the two groups.
     pub arrival_delta: TimeDelta,
-    /// The reported receive time for the last packet in the first arrival group.
-    pub last_remote_recv_time: Instant,
+    /// The reported receive time of the packet starting the next group.
+    pub remote_recv_time: Instant,
 }
 
 #[cfg(test)]
@@ -401,6 +399,28 @@ mod test {
         }
 
         assert_eq!(group.size, 3, "Expected group to contain 4 packets");
+    }
+
+    #[test]
+    fn group_observation_uses_trigger_packet_receive_time() {
+        let now = Instant::now();
+        let mut groups = ArrivalGroupAccumulator::default();
+        let mut delta = None;
+
+        for (seq, send_ms, receive_ms) in [(0, 0, 10), (1, 10, 20), (2, 20, 40)] {
+            delta = groups.accumulate_packet(&AckedPacket {
+                seq_no: seq.into(),
+                size: DataSize::ZERO,
+                local_send_time: now + Duration::from_millis(send_ms),
+                remote_recv_time: now + Duration::from_millis(receive_ms),
+                local_recv_time: now + Duration::from_millis(50),
+            });
+        }
+
+        let delta = delta.unwrap();
+        assert_eq!(delta.send_delta, TimeDelta::from_millis(10));
+        assert_eq!(delta.arrival_delta, TimeDelta::from_millis(10));
+        assert_eq!(delta.remote_recv_time, now + Duration::from_millis(40));
     }
 
     #[test]

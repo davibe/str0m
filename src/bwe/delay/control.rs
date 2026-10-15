@@ -11,8 +11,6 @@ use crate::util::{MovingAverage, already_happened};
 
 const MAX_RTT_HISTORY_WINDOW: usize = 32;
 const UPDATE_INTERVAL: Duration = Duration::from_millis(25);
-/// The maximum time we keep updating our estimate without receiving a TWCC report.
-const MAX_TWCC_GAP: Duration = Duration::from_millis(500);
 /// RFC 6298: Exponentially Weighted Moving Average smoothing factor for RTT (alpha = 1/8)
 const RTT_SMOOTHING_FACTOR: f64 = 0.125;
 
@@ -35,8 +33,6 @@ pub struct DelayController {
 
     /// The next time we should poll.
     next_timeout: Instant,
-    /// The last time we ingested a TWCC report.
-    last_twcc_report: Instant,
 }
 
 impl DelayController {
@@ -49,7 +45,6 @@ impl DelayController {
             smoothed_rtt: MovingAverage::new(RTT_SMOOTHING_FACTOR),
             max_rtt_history: VecDeque::default(),
             next_timeout: already_happened(),
-            last_twcc_report: already_happened(),
         }
     }
 
@@ -83,7 +78,7 @@ impl DelayController {
                 // between packets). Clock skew doesn't matter since we're measuring trends in
                 // delay variations, not absolute times.
                 self.trendline_estimator
-                    .add_delay_observation(delay_variation, delay_variation.last_remote_recv_time);
+                    .add_delay_observation(delay_variation, delay_variation.remote_recv_time);
             }
         }
 
@@ -100,7 +95,6 @@ impl DelayController {
             self.get_smoothed_rtt(),
             now,
         );
-        self.last_twcc_report = now;
 
         self.last_estimate
     }
@@ -109,29 +103,9 @@ impl DelayController {
         self.next_timeout
     }
 
-    pub fn handle_timeout(&mut self, acked_bitrate: Option<Bitrate>, now: Instant) {
-        if !self.trendline_hypothesis_valid(now) {
-            // We haven't received a TWCC report in a while. The trendline hypothesis can
-            // no longer be considered valid. We need another TWCC report before we can update
-            // estimates.
-            let next_timeout_in = self
-                .get_smoothed_rtt()
-                .unwrap_or(MAX_TWCC_GAP)
-                .min(UPDATE_INTERVAL);
-
-            // Set this even if we didn't update, otherwise we get stuck in a poll -> handle loop
-            // that starves the run loop.
-            self.next_timeout = now + next_timeout_in;
-            return;
-        }
-
-        self.update_estimate(
-            self.trendline_estimator.hypothesis(),
-            acked_bitrate,
-            None,
-            self.get_smoothed_rtt(),
-            now,
-        );
+    pub fn handle_timeout(&mut self, now: Instant) {
+        // Keep BWE housekeeping scheduled; rate updates require transport feedback.
+        self.next_timeout = now + UPDATE_INTERVAL;
     }
 
     /// Get the latest estimate.
@@ -213,14 +187,42 @@ impl DelayController {
         // that starves the run loop.
         self.next_timeout = now + UPDATE_INTERVAL;
     }
+}
 
-    /// Whether the current trendline hypothesis is valid i.e. not too old.
-    fn trendline_hypothesis_valid(&self, now: Instant) -> bool {
-        now.duration_since(self.last_twcc_report)
-            <= self
-                .get_smoothed_rtt()
-                .map(|rtt| rtt * 2)
-                .unwrap_or(MAX_TWCC_GAP)
-                .min(UPDATE_INTERVAL * 2)
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn rate_updates_require_feedback() {
+        let now = Instant::now();
+        let mut controller = DelayController::new(Bitrate::kbps(1500));
+        let observed = Some(Bitrate::mbps(2));
+        let packet = AckedPacket {
+            seq_no: 0.into(),
+            size: Default::default(),
+            local_send_time: now,
+            remote_recv_time: now + Duration::from_millis(10),
+            local_recv_time: now + Duration::from_millis(20),
+        };
+        controller.update(&[packet], observed, None, packet.local_recv_time);
+        let estimate = controller.last_estimate().unwrap();
+
+        for offset in 21..=100 {
+            let at = now + Duration::from_millis(offset);
+            controller.handle_timeout(at);
+            assert_eq!(controller.last_estimate(), Some(estimate));
+            assert_eq!(controller.poll_timeout(), at + UPDATE_INTERVAL);
+        }
+
+        let next_packet = AckedPacket {
+            seq_no: 1.into(),
+            local_send_time: now + Duration::from_millis(90),
+            remote_recv_time: now + Duration::from_millis(100),
+            local_recv_time: now + Duration::from_millis(110),
+            ..packet
+        };
+        controller.update(&[next_packet], observed, None, next_packet.local_recv_time);
+        assert!(controller.last_estimate().unwrap() > estimate);
     }
 }

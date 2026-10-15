@@ -102,9 +102,9 @@ impl TrendlineEstimator {
     }
 
     fn do_add_to_history(&mut self, variation: InterGroupDelayDelta, now: Instant) {
-        let last_remote_recv_time = Timestamp::from(variation.last_remote_recv_time);
+        let remote_recv_time = Timestamp::from(variation.remote_recv_time);
 
-        let zero_time = *self.zero_time.get_or_insert(last_remote_recv_time);
+        let zero_time = *self.zero_time.get_or_insert(remote_recv_time);
 
         let delay_delta = variation.arrival_delta.as_secs_f64() * 1000.0
             - variation.send_delta.as_secs_f64() * 1000.0;
@@ -115,7 +115,7 @@ impl TrendlineEstimator {
         self.smoothed_delay =
             self.smoothed_delay * SMOOTHING_COEF + (1.0 - SMOOTHING_COEF) * self.accumulated_delay;
 
-        let remote_recv_time = last_remote_recv_time - zero_time;
+        let remote_recv_time = remote_recv_time - zero_time;
         let timing = Timing {
             at: now,
             remote_recv_time_ms: remote_recv_time.as_secs_f64() * 1000.0,
@@ -393,12 +393,12 @@ mod test {
     fn delay_variation(
         recv_delta: Duration,
         send_delta: Duration,
-        last_remote_recv_time: Instant,
+        remote_recv_time: Instant,
     ) -> InterGroupDelayDelta {
         InterGroupDelayDelta {
             send_delta: send_delta.into(),
             arrival_delta: recv_delta.into(),
-            last_remote_recv_time,
+            remote_recv_time,
         }
     }
 

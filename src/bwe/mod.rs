@@ -290,8 +290,7 @@ impl SendSideBandwidthEstimator {
         do_probe: bool,
         now: Instant,
     ) -> Option<ProbeClusterConfig> {
-        self.delay_controller
-            .handle_timeout(self.acked_bitrate_estimator.current_estimate(), now);
+        self.delay_controller.handle_timeout(now);
 
         // Update probe control with desired bitrate.
         self.probe_control.set_desired_bitrate(desired_bitrate);
@@ -482,5 +481,31 @@ impl fmt::Display for BandwidthUsage {
             BandwidthUsage::Normal => write!(f, "normal"),
             BandwidthUsage::Underuse => write!(f, "underuse"),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn timeouts_expire_smoothed_estimates_without_changing_rate() {
+        let now = Instant::now();
+        let mut bwe = Bwe::new(Bitrate::mbps(1));
+        bwe.handle_timeout(now, false);
+        assert_eq!(bwe.poll_estimate(), Some(Bitrate::mbps(1)));
+
+        let feedback_time = now + Duration::from_secs(1);
+        bwe.bwe
+            .delay_controller
+            .update(&[], None, Some(Bitrate::mbps(2)), feedback_time);
+        bwe.handle_timeout(feedback_time, false);
+        assert_eq!(bwe.poll_estimate(), Some(Bitrate::kbps(1500)));
+
+        let expiry_time = now + Duration::from_secs(4);
+        bwe.handle_timeout(expiry_time, false);
+        assert_eq!(bwe.last_estimate(), Some(Bitrate::mbps(2)));
+        assert_eq!(bwe.poll_estimate(), Some(Bitrate::mbps(2)));
+        assert!(bwe.poll_timeout().0.unwrap() > expiry_time);
     }
 }
