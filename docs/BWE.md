@@ -563,7 +563,8 @@ requires low latency and is typically low-bitrate, so it doesn't cause
 burst issues. In addition, the pacer can raise `adjusted_bitrate` above the
 configured pacing rate to drain long queues within the configured
 `queue_limit` (default 2s), based on current queue size and the observed
-average queue time—this prevents unbounded queue growth during temporary
+average queue time. Repeated polls of an unchanged queue do not raise the
+drain rate. This prevents unbounded queue growth during temporary
 traffic spikes.
 
 Padding is generated in two distinct modes. In normal operation, padding is

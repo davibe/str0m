@@ -234,7 +234,7 @@ impl<'a> DirectApi<'a> {
         let exts = self.rtc.session.exts.cloned_with_type(kind.is_audio());
         let m = Media::from_direct_api(mid, next_index, kind, exts);
 
-        self.rtc.session.medias.push(m);
+        self.rtc.session.add_media(m);
         self.rtc.session.medias.last_mut().unwrap()
     }
 

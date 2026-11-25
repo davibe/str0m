@@ -40,6 +40,10 @@ impl PacerImpl {
         }
     }
 
+    pub fn refresh_after_send(&self, is_padding: bool) -> bool {
+        matches!(self, Self::LeakyBucket(pacer) if pacer.refresh_after_send(is_padding))
+    }
+
     pub fn active_cluster(&self) -> Option<TwccClusterId> {
         match self {
             PacerImpl::Null(_) => None,

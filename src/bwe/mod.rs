@@ -129,6 +129,10 @@ impl Bwe {
         self.bwe.rtt_backoff.on_packet_sent(now);
     }
 
+    pub fn has_transport_feedback(&self) -> bool {
+        self.bwe.started_at.is_some()
+    }
+
     pub fn is_overusing(&self) -> bool {
         self.bwe.is_overusing()
     }

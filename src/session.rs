@@ -1334,6 +1334,11 @@ impl Session {
             self.media_bytes_tx += payload_size as u64;
         }
 
+        // Let the next output poll drain queued packets that are already due.
+        if payload_size > 0 && self.pacer.refresh_after_send(is_padding) {
+            self.update_queue_state(now, self.probe_media());
+        }
+
         Some(protected.into())
     }
 
@@ -1468,6 +1473,7 @@ impl Session {
 
     pub fn add_media(&mut self, media: Media) {
         self.medias.push(media);
+        self.configure_pacer();
     }
 
     pub fn medias(&self) -> &[Media] {
@@ -1477,6 +1483,7 @@ impl Session {
     pub fn remove_media(&mut self, mid: Mid) {
         self.medias.retain(|media| media.mid() != mid);
         self.streams.remove_streams_by_mid(mid);
+        self.configure_pacer();
     }
 
     fn configure_pacer(&mut self) {
@@ -1500,13 +1507,18 @@ impl Session {
         }
         let is_overuse = bwe.is_overusing();
         let minimum = bwe.minimum_bitrate();
+        let has_transport_feedback = bwe.has_transport_feedback();
 
         let has_active_media = self.has_active_outgoing_media();
 
         // Calculate pacing and padding rates
-        let result =
-            self.pacer_control
-                .calculate(has_active_media, current_estimate, is_overuse, minimum);
+        let result = self.pacer_control.calculate(
+            has_active_media,
+            current_estimate,
+            is_overuse,
+            minimum,
+            has_transport_feedback,
+        );
 
         self.pacer.set_padding_rate(result.padding_rate);
         self.pacer.set_pacing_rate(result.pacing_rate);
