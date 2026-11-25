@@ -51,8 +51,6 @@ pub use probe::ProbeClusterConfig;
 #[cfg(not(feature = "_internal_test_exports"))]
 pub(crate) use probe::ProbeClusterConfig;
 
-const STARTUP_PHASE: Duration = Duration::from_secs(2);
-
 pub struct Bwe {
     bwe: SendSideBandwidthEstimator,
     desired_bitrate: Bitrate,
@@ -229,8 +227,7 @@ impl SendSideBandwidthEstimator {
         let mut alr_detector = AlrDetector::new();
         alr_detector.set_estimated_bitrate(initial_bitrate);
 
-        let mut loss_controller = LossController::new();
-        loss_controller.set_bandwidth_estimate(initial_bitrate);
+        let loss_controller = LossController::new();
 
         Self {
             rtt_backoff: RttBasedBackoff::default(),
@@ -287,16 +284,16 @@ impl SendSideBandwidthEstimator {
 
         let mut acked_packets = vec![];
 
-        let mut count = 0;
-        let mut lost = 0;
         for record in send_records.iter() {
-            count += 1;
-            let Ok(acked_packet) = (*record).try_into() else {
-                lost += 1;
-                continue;
-            };
-            acked_packets.push(acked_packet);
+            if let Ok(packet) = (*record).try_into() {
+                acked_packets.push(packet);
+            }
         }
+        log_loss!(if send_records.is_empty() {
+            0.0
+        } else {
+            (send_records.len() - acked_packets.len()) as f64 / send_records.len() as f64
+        });
         acked_packets.sort_by(AckedPacket::order_by_receive_time);
 
         self.rtt_backoff.on_feedback(&acked_packets, now);
@@ -324,24 +321,6 @@ impl SendSideBandwidthEstimator {
         };
         self.rtt_backoff
             .update(now, current_target, Some(delay_estimate));
-
-        let loss = if count == 0 {
-            0.0
-        } else {
-            lost as f64 / count as f64
-        };
-        log_loss!(loss);
-
-        // During startup with no loss, use delay-based estimate directly
-        if in_startup_phase(self.started_at, now) && loss <= 0.001 {
-            self.loss_controller.set_bandwidth_estimate(delay_estimate);
-            return;
-        }
-
-        // When probe succeeds, set bandwidth directly
-        if is_probe_result {
-            self.loss_controller.set_bandwidth_estimate(delay_estimate);
-        }
 
         if let Some(acked_bitrate) = acked_bitrate {
             self.loss_controller.set_acknowledged_bitrate(acked_bitrate);
@@ -458,21 +437,12 @@ impl SendSideBandwidthEstimator {
 
         let loss_result = self.loss_controller.loss_based_result();
 
-        // Only apply loss-based limiting when actively in a loss-limiting state
-        match loss_result.state {
-            LossControllerState::DelayBased => {
-                // Loss controller defers to delay-based estimate
-                delay_estimate
-            }
-            LossControllerState::Decreasing | LossControllerState::Increasing => {
-                // Loss controller is actively limiting or recovering
-                match (delay_estimate, loss_result.bandwidth_estimate) {
-                    (Some(de), Some(le)) => Some(de.min(le)),
-                    (None, le @ Some(_)) => le,
-                    (de @ Some(_), None) => de,
-                    (None, None) => None,
-                }
-            }
+        if self.loss_controller.is_ready() {
+            loss_result
+                .bandwidth_estimate
+                .map(|rate| delay_estimate.map_or(rate, |delay| delay.min(rate)))
+        } else {
+            delay_estimate
         }
     }
 
@@ -524,13 +494,6 @@ impl AckedPacket {
             lhs.seq_no.cmp(&rhs.seq_no)
         }
     }
-}
-
-// NB: Extracted for lifetime reasons
-fn in_startup_phase(started_at: Option<Instant>, now: Instant) -> bool {
-    started_at
-        .map(|s| now.duration_since(s) <= STARTUP_PHASE)
-        .unwrap_or(false)
 }
 
 impl TryFrom<&TwccSendRecord> for AckedPacket {

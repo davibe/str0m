@@ -89,9 +89,6 @@ pub struct LossController {
 
     /// Link capacity estimate from probes during ALR
     link_capacity_estimate: Option<Bitrate>,
-
-    /// Previous ALR state to detect transitions
-    was_in_alr: bool,
 }
 
 /// State of the Loss Controller
@@ -148,7 +145,6 @@ impl LossController {
 
             alr_start_time: None,
             link_capacity_estimate: None,
-            was_in_alr: false,
 
             config,
         };
@@ -183,22 +179,7 @@ impl LossController {
 
     /// Set ALR start time from the ALR detector.
     pub fn set_alr_start_time(&mut self, alr_start: Option<Instant>) {
-        let was_in_alr = self.was_in_alr;
-        let is_in_alr = alr_start.is_some();
-
-        // Detect ALR state transition
-        if was_in_alr != is_in_alr {
-            // Reset observations on ALR transition to avoid mixing
-            // ALR and non-ALR traffic in the same observation window
-            self.reset_observations();
-            trace!(
-                "LossController: ALR state changed (was: {}, now: {}), observations reset",
-                was_in_alr, is_in_alr
-            );
-        }
-
         self.alr_start_time = alr_start;
-        self.was_in_alr = is_in_alr;
     }
 
     /// Set link capacity estimate from successful ALR probes.
@@ -211,21 +192,8 @@ impl LossController {
         self.alr_start_time.is_some()
     }
 
-    /// Reset all observations.
-    ///
-    /// Called when ALR state transitions to avoid mixing traffic patterns
-    /// from different network utilization regimes.
-    fn reset_observations(&mut self) {
-        self.partial_observation = PartialObservation::new();
-        self.last_send_time_most_recent_observation = Timestamp::DistantFuture;
-
-        // Clear observation window
-        for observation in self.observations.iter_mut() {
-            *observation = Observation::DUMMY;
-        }
-
-        // Reset cached values that depend on observations
-        self.cached_instant_upper_bound = None;
+    pub fn is_ready(&self) -> bool {
+        self.num_observations >= 3
     }
 
     /// Update the estimate using TWCC feedback from the network.
@@ -247,8 +215,7 @@ impl LossController {
         }
 
         if !self.current_estimate.loss_limited_bandwidth.is_valid() {
-            warn!("estimator must be initialized before use");
-            return;
+            self.set_bandwidth_estimate(delay_based_estimated);
         }
 
         let mut best_candidate = self.current_estimate;
@@ -448,12 +415,13 @@ impl LossController {
             return false;
         };
 
+        let first_send_time = Timestamp::from(summary.first_send_time);
         let last_send_time = Timestamp::from(summary.last_send_time);
 
         self.partial_observation.update(summary);
 
         if !self.last_send_time_most_recent_observation.is_exact() {
-            self.last_send_time_most_recent_observation = last_send_time;
+            self.last_send_time_most_recent_observation = first_send_time;
         }
 
         let observation_duration = last_send_time - self.last_send_time_most_recent_observation;
@@ -463,7 +431,7 @@ impl LossController {
         }
 
         // decide if we can accept the partial observation as complete
-        if observation_duration <= self.config.observation_duration_lower_bound {
+        if observation_duration < self.config.observation_duration_lower_bound {
             return false;
         }
 

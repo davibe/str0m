@@ -285,16 +285,10 @@ mechanism to prevent rapid ramp-up immediately after loss events—loss often
 indicates we've already exceeded capacity, so we need time to verify the
 network has recovered before growing again.
 
-During the startup phase (first 2 seconds) when no loss has occurred, the
-controller defers entirely to the delay-based estimate since we don't have
-enough data for loss statistics. After a successful probe completes, it
-adopts the probe result immediately, trusting the active measurement over
-passive observation—probes provide ground truth about what the network can
-handle. The controller only ever reduces estimates, acting as a safety cap
-on the delay-based estimate rather than competing with it. This design
-prevents the loss controller from causing premature rate reductions based
-on transient loss while still catching cases where delay signals miss
-congestion.
+Until three loss observations are complete, str0m uses the delay-based
+estimate. After that, the loss estimate can cap the send target even when
+a probe succeeds. This avoids raising the target prematurely when a short
+probe gets through but recent loss suggests that rate may be hard to sustain.
 
 Like libwebrtc, the controller uses acknowledged throughput as a lower
 bound, with a minimum of 1 kbps. This prevents sustained loss from driving
@@ -304,10 +298,8 @@ delivered.
 The controller integrates with ALR detection and link capacity tracking.
 When in ALR, it uses proven link capacity from successful ALR probes as an
 upper bound on estimates, preventing overestimation in application-limited
-scenarios. When transitioning into or out of ALR, the controller resets
-its observation window to avoid mixing traffic patterns from different
-network utilization regimes, ensuring accurate loss characterization for
-each operating mode.
+scenarios. The loss controller keeps its observation history when entering or
+leaving ALR.
 
 The loss-based bandwidth estimate flows to the SendSideBandwidthEstimator
 where it's merged with the delay-based estimate, along with the loss
