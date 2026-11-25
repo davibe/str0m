@@ -45,6 +45,7 @@ pub struct RtcConfig {
     pub(crate) intervals: RtcpReportIntervals,
     pub(crate) bwe_config: Option<BweConfig>,
     pub(crate) bwe_smoothing: bool,
+    pub(crate) probe_without_media: bool,
     pub(crate) reordering_size_audio: usize,
     pub(crate) reordering_size_video: usize,
     pub(crate) reordering_timeout_audio: Option<Duration>,
@@ -515,6 +516,15 @@ impl RtcConfig {
         self
     }
 
+    /// Allow the pacer to start a bandwidth probe while the application is silent.
+    ///
+    /// By default an inactive prober waits for a sufficiently large packet to be
+    /// queued. Enable this to measure bandwidth before sending the first media.
+    pub fn set_probe_without_media(mut self, enabled: bool) -> Self {
+        self.probe_without_media = enabled;
+        self
+    }
+
     /// Returns the setting of [`Self::set_bwe_smoothing()`].
     ///
     /// ```
@@ -926,6 +936,7 @@ impl Default for RtcConfig {
             },
             bwe_config: None,
             bwe_smoothing: true,
+            probe_without_media: false,
             reordering_size_audio: 15,
             reordering_size_video: 30,
             reordering_timeout_audio: Some(Duration::from_secs(1)),

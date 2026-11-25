@@ -108,6 +108,8 @@ pub(crate) struct Session {
     bwe: Option<Bwe>,
     bwe_last_event: Option<(Bitrate, bool)>,
     bwe_smoothing: bool,
+    probe_without_media: bool,
+    waiting_probes: VecDeque<(Instant, crate::bwe_::ProbeClusterConfig)>,
 
     enable_twcc_feedback: bool,
 
@@ -152,7 +154,7 @@ pub(crate) struct Session {
     mtu: RangeInclusive<usize>,
 
     #[cfg(feature = "_internal_test_exports")]
-    pending_probe: Option<crate::bwe_::ProbeClusterConfig>,
+    pending_probes: VecDeque<crate::bwe_::ProbeClusterConfig>,
 }
 
 /// Last RRTR (Receiver Reference Time Report, RFC 3611 §4.4) received from a remote SSRC.
@@ -216,6 +218,8 @@ impl Session {
             bwe,
             bwe_last_event: None,
             bwe_smoothing: config.bwe_smoothing,
+            probe_without_media: config.probe_without_media,
+            waiting_probes: VecDeque::new(),
             enable_twcc_feedback: false,
             pacer,
             pacer_control: PacerControl::new(),
@@ -238,7 +242,7 @@ impl Session {
             pending_app_feedback: None,
             mtu: config.mtu.clone(),
             #[cfg(feature = "_internal_test_exports")]
-            pending_probe: None,
+            pending_probes: VecDeque::new(),
         }
     }
 
@@ -374,14 +378,42 @@ impl Session {
         let do_probe = probe_media.is_some();
         let bwe = self.bwe.as_mut()?;
 
-        if let Some(probe_config) = bwe.handle_timeout(now, do_probe) {
-            // Only start the probe in the pacer if the estimator accepted it.
-            if bwe.start_probe(probe_config, now) {
-                #[cfg(feature = "_internal_test_exports")]
-                {
-                    self.pending_probe = Some(probe_config);
+        let largest_enqueue = self
+            .streams
+            .streams_tx()
+            .map(|stream| stream.take_largest_enqueue())
+            .max()
+            .unwrap_or(0);
+        // BitrateProber::OnIncomingPacket activates the entire pending train.
+        // A packet already queued before the request must not activate a new train.
+        let mut ready = self.probe_without_media || self.pacer.active_cluster().is_some();
+        if let Some((_, first)) = self.waiting_probes.front() {
+            let threshold = (first.target_bitrate() * first.min_probe_delta())
+                .as_bytes_usize()
+                .min(200);
+            ready |= largest_enqueue >= threshold;
+        }
+        if let Some(config) = bwe.handle_timeout(now, do_probe) {
+            // Match BitrateProber::CreateProbeCluster's pruning on a new request.
+            while self
+                .waiting_probes
+                .front()
+                .is_some_and(|(at, _)| now.duration_since(*at) > Duration::from_secs(5))
+                || self.waiting_probes.len() > 5
+            {
+                self.waiting_probes.pop_front();
+            }
+            self.waiting_probes.push_back((now, config));
+        }
+        if ready && do_probe {
+            for (_, probe_config) in self.waiting_probes.drain(..) {
+                if bwe.start_probe(probe_config, now) {
+                    #[cfg(feature = "_internal_test_exports")]
+                    {
+                        self.pending_probes.push_back(probe_config);
+                    }
+                    self.pacer.start_probe(probe_config);
                 }
-                self.pacer.start_probe(probe_config);
             }
         }
 
@@ -1041,7 +1073,7 @@ impl Session {
     pub fn poll_event(&mut self) -> Option<Event> {
         #[cfg(feature = "_internal_test_exports")]
         {
-            if let Some(probe) = self.pending_probe.take() {
+            if let Some(probe) = self.pending_probes.pop_front() {
                 return Some(Event::Probe(probe));
             }
         }
@@ -1462,6 +1494,7 @@ impl Session {
     pub fn reset_bwe(&mut self, init_bitrate: Bitrate) {
         if let Some(bwe) = self.bwe.as_mut() {
             bwe.reset(init_bitrate);
+            self.waiting_probes.clear();
             self.configure_pacer();
         }
     }

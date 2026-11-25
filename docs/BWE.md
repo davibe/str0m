@@ -303,7 +303,7 @@ concepts are unified into this single value.
 **Probing Triggers:**
 
 1. **Initial Exponential Probing**: On startup or when BWE becomes active
-   (`on_bwe_active()`), sends two probe clusters immediately at 3× and 6×
+   (`on_bwe_active()`), requests two probe clusters at 3× and 6×
    the start bitrate (`first_exponential_probe_scale` = 3.0,
    `second_exponential_probe_scale` = 6.0). These use standard probe
    parameters (15ms duration, 2ms min delta between bursts). The
@@ -407,26 +407,14 @@ Defines what to send for a probe cluster, split into two related
 structures. `ProbeClusterConfig` serves as the immutable blueprint
 containing a unique `cluster_id` for TWCC tagging, the `target_bitrate` to
 probe at, the `target_duration` to sustain (default 15ms), the
-`min_packet_count` required (default 5 packets), and the `min_probe_delta`
-(minimum time between probe bursts, default 2ms). These parameters match
-WebRTC's `ProbeClusterConfig` structure and defaults.
+minimum number of send bursts (default 5), and the target spacing
+between bursts (default 2 ms).
 
-`ProbeClusterState` handles runtime tracking during probe execution,
-monitoring bytes and packets sent while calculating the next probe time
-based on both the target bitrate pacing and the `min_probe_delta`
-constraint. The `min_probe_delta` enforces a minimum spacing between probe
-packet bursts, preventing probes from overwhelming receiver buffers with
-back-to-back packets—even high-speed networks need time to process and
-feedback packet arrivals. When requesting padding for a burst, the state
-calculates `burst_bytes = target_bitrate × min_probe_delta` to ensure each
-burst is large enough to achieve the target rate given the spacing
-constraint.
-
-Completion occurs when both thresholds are met: sent bytes must equal or
-exceed `target_bitrate × target_duration`, and sent packets must equal or
-exceed `min_packet_count` (5 packets). The state signals probe completion
-to the SendSideBandwidthEstimator via the Pacer, marking the end of the
-sending phase and beginning the analysis phase.
+By default an inactive prober waits for a sufficiently large outgoing media packet to be queued.
+Applications can opt into probing during silence with `set_probe_without_media`.
+Media and padding can contribute to the same burst across output polls.
+The cluster completes after meeting both its byte target and its minimum
+burst count. Queued clusters inherit the preceding burst deadline.
 
 #### Probe Estimator
 

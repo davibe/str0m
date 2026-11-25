@@ -408,10 +408,15 @@ fn assert_no_twcc_estimates(rtc: &TestRtc) {
 }
 
 fn peers(feedback: bool) -> (TestRtc, TestRtc) {
+    peers_with_probe_mode(feedback, true)
+}
+
+fn peers_with_probe_mode(feedback: bool, immediate: bool) -> (TestRtc, TestRtc) {
     common::init_log();
     init_crypto_default();
     let now = Instant::now();
     let l = Rtc::builder()
+        .set_probe_without_media(immediate)
         .set_rtp_mode(true)
         .enable_raw_packets(true)
         .enable_bwe(Some(Bitrate::kbps(300)))
@@ -474,4 +479,28 @@ fn assert_feedback_and_no_media(l: &TestRtc, r: &TestRtc) {
             .any(|(_, event)| matches!(event, Event::RtpPacket(_) | Event::MediaData(_))),
         "probes must not be delivered as media"
     );
+}
+
+#[test]
+fn inactive_probe_waits_for_a_large_enqueue() -> Result<(), RtcError> {
+    let (mut l, mut r) = peers_with_probe_mode(true, false);
+    let mid = "vid".into();
+    let ssrc = 42.into();
+    l.direct_api().declare_media(mid, MediaKind::Video);
+    r.direct_api().declare_media(mid, MediaKind::Video);
+    l.direct_api().declare_stream_tx(ssrc, None, mid, None);
+    r.direct_api().expect_stream_rx(ssrc, None, mid, None);
+    run(&mut l, &mut r, Duration::from_millis(300))?;
+    assert_eq!(probes(&l), 0);
+    let pt = l.params_vp8().pt();
+    for (seq, size) in [(1, 10), (2, 1150)] {
+        let now = l.last;
+        l.direct_api()
+            .stream_tx(&ssrc)
+            .unwrap()
+            .write_rtp(RtpWrite::new(pt, seq.into(), 90000, now, vec![0; size]));
+        run(&mut l, &mut r, Duration::from_millis(100))?;
+        assert_eq!(probes(&l) > 0, size == 1150);
+    }
+    Ok(())
 }

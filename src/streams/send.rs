@@ -127,6 +127,8 @@ pub struct StreamTx {
 
     /// The queue information sampled during the latest pacer update.
     queue_info: Option<QueueSnapshot>,
+    /// Largest individual RTP enqueue since the previous BWE poll.
+    largest_enqueue: usize,
 
     /// Whether this sender is to be unpaced in BWE situations.
     ///
@@ -138,6 +140,8 @@ pub struct StreamTx {
 
     /// Requested padding, that has not been turned into packets yet.
     padding: usize,
+    /// Extra RTX bytes allowed for the complete outstanding padding request.
+    padding_overshoot: usize,
 
     /// Dummy packet for resends. Used between poll_packet and poll_packet_padding
     blank_packet: RtpPacket,
@@ -376,9 +380,11 @@ impl StreamTx {
             rtp_and_wallclock: None,
             send_queue: SendQueue::new(),
             queue_info: None,
+            largest_enqueue: 0,
             unpaced: None,
             resends: VecDeque::new(),
             padding: 0,
+            padding_overshoot: 0,
             blank_packet: RtpPacket::blank(),
             rtx_cache: RtxCache::new(2000, DEFAULT_RTX_CACHE_DURATION),
             rtx_ratio_cap: DEFAULT_RTX_RATIO_CAP,
@@ -553,7 +559,15 @@ impl StreamTx {
             last_sender_info: None,
         };
 
+        // Header extensions are finalized later, when the pacer emits the packet.
+        self.largest_enqueue = self
+            .largest_enqueue
+            .max(12 + 4 * usize::from(csrc_count) + packet.payload.len());
         self.send_queue.push(packet);
+    }
+
+    pub(crate) fn take_largest_enqueue(&mut self) -> usize {
+        std::mem::take(&mut self.largest_enqueue)
     }
 
     fn padding_enabled(&self) -> bool {
@@ -817,6 +831,11 @@ impl StreamTx {
             }
         }
 
+        // Padding is materialized here, one packet at a time. The requested
+        // padding budget can span several packets and must not open the gate.
+        if is_padding {
+            self.largest_enqueue = self.largest_enqueue.max(header_len + body_len);
+        }
         Some(PacketReceipt {
             header,
             seq_no,
@@ -945,10 +964,14 @@ impl StreamTx {
 
         #[allow(clippy::unnecessary_operation)]
         'outer: {
-            if !self.ssrc.is_probe() && self.padding > MIN_SPURIOUS_PADDING_SIZE {
+            if !self.ssrc.is_probe() && self.padding >= MIN_SPURIOUS_PADDING_SIZE {
                 // Find a historic packet that is smaller than this max size. The max size
                 // is a headroom since we can accept slightly larger padding than asked for.
-                let max_size = (self.padding * 2).min(self.mtu_warn - MAX_RTP_OVERHEAD);
+                let max_size = self
+                    .padding
+                    .saturating_add(self.padding_overshoot)
+                    .saturating_sub(2)
+                    .min(self.mtu_warn.saturating_sub(MAX_RTP_OVERHEAD));
 
                 let Some(pkt) = self.rtx_cache.get_cached_packet_smaller_than(max_size) else {
                     // Couldn't find spurious packet, try a blank packet instead.
@@ -958,7 +981,7 @@ impl StreamTx {
                 let orig_seq_no = pkt.seq_no;
                 let seq_no = self.seq_no_rtx.inc();
 
-                self.padding = self.padding.saturating_sub(pkt.payload.len());
+                self.padding = self.padding.saturating_sub(pkt.payload.len() + 2);
 
                 return Some(NextPacket {
                     kind: NextPacketKind::Resend(orig_seq_no),
@@ -1091,6 +1114,7 @@ impl StreamTx {
                 queued_at: now,
                 payload_size: cached.packet.payload.len(),
             };
+            self.largest_enqueue = self.largest_enqueue.max(12 + 2 + resend.payload_size);
             self.resends.push_back(resend);
         }
 
@@ -1288,7 +1312,8 @@ impl StreamTx {
         if !self.padding_enabled() {
             return;
         }
-        self.padding += padding;
+        self.padding = self.padding.saturating_add(padding);
+        self.padding_overshoot = self.padding.saturating_mul(2);
     }
 
     pub(crate) fn need_timeout(&self) -> bool {
@@ -1338,6 +1363,7 @@ impl StreamTx {
     }
 
     pub(crate) fn reset_buffers(&mut self) {
+        self.largest_enqueue = 0;
         self.send_queue.clear();
         self.queue_info = None;
         self.rtx_cache.clear();
@@ -1544,6 +1570,36 @@ mod test {
             assert_eq!(stream.resends.len(), 1);
             assert_eq!(stream.resends[0].seq_no, 4.into());
         }
+    }
+
+    #[test]
+    fn rtx_padding_uses_original_request_for_the_overshoot_limit() {
+        let now = Instant::now();
+        let codecs = CodecConfig::new_with_defaults();
+        let pt = codecs
+            .params()
+            .iter()
+            .find(|p| p.resend().is_some())
+            .unwrap()
+            .pt();
+        let exts = ExtensionMap::standard();
+        let mut streams = crate::streams::Streams::new(false, 1400, Duration::from_millis(1500));
+        let stream =
+            streams.declare_stream_tx(42.into(), Some(44.into()), MidRid("vid".into(), None));
+        let mut buf = vec![];
+        stream.write_rtp(RtpWrite::new(pt, 1.into(), 0, now, vec![0; 1150]).nackable(true));
+        stream.send_queue.handle_timeout(now);
+        stream
+            .poll_packet(now, &exts, None, codecs.params(), &mut buf)
+            .unwrap();
+        stream.generate_padding(1250);
+        for _ in 0..2 {
+            let sent = stream
+                .poll_packet(now, &exts, None, codecs.params(), &mut buf)
+                .unwrap();
+            assert_eq!(sent.payload_size, 1152);
+        }
+        assert_eq!(stream.padding, 0);
     }
 
     #[test]

@@ -235,8 +235,17 @@ impl LeakyBucketPacer {
         self.request_immediate_timeout();
     }
 
+    pub(crate) fn probe_burst_in_progress(&self) -> bool {
+        self.probe_queue
+            .front()
+            .is_some_and(ProbeClusterState::burst_in_progress)
+    }
+
     /// Whether another output poll might send at the same instant.
     pub(crate) fn refresh_after_send(&self, is_padding: bool) -> bool {
+        if self.probe_burst_in_progress() {
+            return true;
+        }
         if is_padding || !self.probe_queue.is_empty() {
             return false;
         }
@@ -275,7 +284,11 @@ impl LeakyBucketPacer {
 
         if probe.is_complete(now) {
             let cluster_id = probe.config().cluster();
+            let next_burst = probe.next_probe_time();
             self.probe_queue.pop_front();
+            if let Some(next) = self.probe_queue.front_mut() {
+                next.defer_start_until(next_burst);
+            }
             return Some(cluster_id);
         }
 
@@ -648,6 +661,24 @@ mod test {
                 .handle_timeout(deadline, std::iter::once(queue))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn queued_probe_respects_the_last_burst_deadline() {
+        use crate::bwe_::ProbeKind;
+
+        let now = Instant::now();
+        let mut pacer = LeakyBucketPacer::new(Bitrate::mbps(1));
+        for id in [0u64, 1] {
+            let config = ProbeClusterConfig::new(id.into(), Bitrate::mbps(1), ProbeKind::Initial)
+                .with_duration(Duration::from_millis(2))
+                .with_min_packet_count(1);
+            pacer.start_probe(config);
+        }
+        pacer.register_send(now, DataSize::bytes(250), MidRid("video".into(), None));
+        let next = pacer.probe_queue.front().unwrap();
+        assert!(!next.should_send_now(now));
+        assert_eq!(next.next_probe_time(), now + Duration::from_millis(2));
     }
 
     #[test]
