@@ -342,6 +342,8 @@ concepts are unified into this single value.
    old, and the sender must be in ALR or have left it less than 3 s ago.
    A pending probe result or a congestion gate can suppress the request.
 
+   A recovery probe does not start an exponential sequence.
+
 Outside ALR, a stable estimate alone does not trigger a probe.
 
 **Gating Rules:**
@@ -660,15 +662,13 @@ transmission smoothing and padding generation respectively.
 
 ### Deviations
 
-1. **Exponential Probing After All Probe Types:**
+1. **Exponential probing after allocation probes:**
    - **WebRTC**: Further probing depends on the probe's `probe_further` flag.
      Startup, periodic ALR and network-state probes allow it; allocation
      probes allow it when capped by the current estimate. Large-drop
      recovery probes do not allow further probing
-   - **str0m**: Any probe type can lead to exponential probing when its
-     result exceeds 70% of the target rate
-   - **Impact**: Capacity discovery can continue after large-drop recovery
-     probes as well as startup and ALR probes
+   - **str0m**: Large-drop recovery requests one probe. Allocation probes
+     can trigger exponential follow-up below the cap.
 
 2. **Padding Strategy:**
    - **WebRTC**: Layer/stream requirements and minimum transmit configuration

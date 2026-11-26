@@ -428,7 +428,7 @@ impl ProbeControl {
             kind,
             further: probe_further,
             was_estimate: self.last_estimate,
-            allow_further: bitrate < max,
+            allow_further: bitrate < max && kind != ProbeKind::LargeDrop,
         });
     }
 
@@ -1025,6 +1025,15 @@ mod test {
             assert!(probe.target_bitrate() >= Bitrate::mbps(4));
             assert!(probe.target_bitrate() <= Bitrate::mbps(5));
         }
+        pc.set_estimated_bitrate(
+            later + Duration::from_millis(50),
+            Bitrate::mbps(4),
+            BandwidthLimitedCause::DelayBasedLimited,
+        );
+        assert!(
+            pc.handle_timeout(later + Duration::from_millis(50))
+                .is_none()
+        );
     }
 
     #[test]
