@@ -1244,7 +1244,7 @@ impl Rtc {
             // this expect message.
             .expect("a crash earlier if no crypto provider was set");
 
-        let session = Session::new(&config);
+        let session = Session::new(&config, start);
 
         // Capture before any partial moves of `config` below.
         let mtu = config.mtu.clone();

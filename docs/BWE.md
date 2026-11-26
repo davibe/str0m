@@ -147,6 +147,10 @@ The controller produces a delay-based bandwidth estimate along with an
 overuse state signal, both of which flow to the SendSideBandwidthEstimator
 for final bandwidth determination.
 
+Periodic TWCC feedback starts at 100 ms. The receiver adjusts the interval
+within 50–250 ms using the local send bandwidth estimate and a 5% feedback
+budget. The reporting clock advances across idle periods.
+
 ### Arrival Group Accumulator
 
 **Location:** `src/bwe/delay/arrival_group.rs`

@@ -47,8 +47,11 @@ use crate::{RtcConfig, RtcError};
 /// Keep this high enough to avoid additional problems in very bad network conditions.
 const NACK_MIN_INTERVAL: Duration = Duration::from_millis(33);
 
-/// Delay between reports of TWCC. This is deliberately very low.
-const TWCC_INTERVAL: Duration = Duration::from_millis(50);
+/// Default periodic transport feedback interval used by libwebrtc.
+const TWCC_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Average TWCC report size including IPv4, UDP and SRTCP overhead.
+const TWCC_REPORT_BYTES: u32 = 20 + 8 + 10 + 30;
 
 /// Maximum number of pending RRTR entries before oldest are dropped.
 const MAX_PENDING_RRTRS: usize = 300;
@@ -91,7 +94,10 @@ pub(crate) struct Session {
     srtp_rx: Option<SrtpContext>,
     srtp_tx: Option<SrtpContext>,
     last_nack: Instant,
-    last_twcc: Instant,
+    /// Local deadline for the next periodic feedback report.
+    next_twcc: Instant,
+    /// Current spacing between periodic feedback reports.
+    twcc_interval: Duration,
     twcc: u64,
     twcc_rx_register: TwccRecvRegister,
     twcc_tx_register: TwccSendRegister,
@@ -159,7 +165,7 @@ struct LastRrtr {
 }
 
 impl Session {
-    pub fn new(config: &RtcConfig) -> Self {
+    pub fn new(config: &RtcConfig, start: Instant) -> Self {
         let mut id = SessionId::new();
         // Max 2^62 - 1: https://bugzilla.mozilla.org/show_bug.cgi?id=861895
         const MAX_ID: u64 = 2_u64.pow(62) - 1;
@@ -198,7 +204,8 @@ impl Session {
             srtp_rx: None,
             srtp_tx: None,
             last_nack: already_happened(),
-            last_twcc: already_happened(),
+            next_twcc: start + TWCC_INTERVAL,
+            twcc_interval: TWCC_INTERVAL,
             twcc: 0,
             twcc_rx_register: TwccRecvRegister::new(100),
             twcc_tx_register: TwccSendRegister::new(1000),
@@ -445,7 +452,7 @@ impl Session {
     }
 
     fn create_twcc_feedback(&mut self, sender_ssrc: Ssrc, now: Instant) -> Option<()> {
-        self.last_twcc = now;
+        self.next_twcc = now + self.twcc_interval;
         let mut twcc = self.twcc_rx_register.build_report(self.mtu() - 100)?;
 
         // These SSRC are on media level, but twcc is on session level,
@@ -730,6 +737,10 @@ impl Session {
         // Mark as received for TWCC purposes
         if let Some(transport_cc) = header.ext_vals.transport_cc {
             if let Some(seq) = self.twcc_rx_register.extend_seq(transport_cc) {
+                // Advance past idle slots so the first packet after silence does not trigger an immediate report.
+                if !self.twcc_rx_register.has_unreported() && self.next_twcc < now {
+                    self.next_twcc = Self::next_twcc_slot(self.next_twcc, now, self.twcc_interval);
+                }
                 self.twcc_rx_register.update_seq(seq, now);
             }
         }
@@ -1371,11 +1382,19 @@ impl Session {
         Some(self.last_nack + NACK_MIN_INTERVAL)
     }
 
+    // Skip unused slots without waking an idle receiver or moving the clock
+    // phase to the first packet that arrives after silence.
+    fn next_twcc_slot(deadline: Instant, now: Instant, interval: Duration) -> Instant {
+        let elapsed = now.saturating_duration_since(deadline);
+        let remainder = elapsed.as_nanos() % interval.as_nanos();
+        now + interval - Duration::from_nanos(remainder as u64)
+    }
+
     fn twcc_at(&self) -> Option<Instant> {
         // Early RTX padding can create transport receipts before any receive stream exists.
         // Scheduling by pending receipts ensures that padding still receives timely feedback.
         if self.enable_twcc_feedback && self.twcc_rx_register.has_unreported() {
-            Some(self.last_twcc + TWCC_INTERVAL)
+            Some(self.next_twcc)
         } else {
             None
         }
@@ -1447,6 +1466,16 @@ impl Session {
             // No estimate yet, no padding
             return;
         };
+        // Budget 5% of the local send estimate for reverse TWCC.
+        let interval = Duration::from_micros(
+            (f64::from(TWCC_REPORT_BYTES) * 8.0 * 1_000_000.0 / (0.05 * current_estimate.as_f64()))
+                .clamp(50_000.0, 250_000.0)
+                .round() as u64,
+        );
+        if interval != self.twcc_interval {
+            self.next_twcc = self.next_twcc - self.twcc_interval + interval;
+            self.twcc_interval = interval;
+        }
         let is_overuse = bwe.is_overusing();
         let minimum = bwe.minimum_bitrate();
 
@@ -1623,8 +1652,31 @@ mod tests {
     use crate::poll::Readiness;
     use crate::rtp_::RtcpPacket;
 
+    #[test]
+    fn twcc_deadline_uses_actual_poll_time_and_does_not_wake_idle_receiver() {
+        let start = Instant::now();
+        let mut session = Session::new(&RtcConfig::default(), start);
+        session.enable_twcc_feedback();
+        assert_eq!(session.twcc_at(), None);
+        session
+            .twcc_rx_register
+            .update_seq(1.into(), start + Duration::from_millis(41));
+        assert_eq!(session.twcc_at(), Some(start + TWCC_INTERVAL));
+        session
+            .create_twcc_feedback(42.into(), start + Duration::from_millis(102))
+            .unwrap();
+        assert_eq!(session.twcc_at(), None);
+        assert_eq!(session.next_twcc, start + Duration::from_millis(202));
+        session.next_twcc = Session::next_twcc_slot(
+            session.next_twcc,
+            start + Duration::from_millis(1549),
+            TWCC_INTERVAL,
+        );
+        assert_eq!(session.next_twcc, start + Duration::from_millis(1602));
+    }
+
     fn keyed_session() -> Session {
-        let mut session = Session::new(&RtcConfig::default());
+        let mut session = Session::new(&RtcConfig::default(), Instant::now());
         let crypto = crate::crypto::test_default_provider();
         let profile = SrtpProfile::AEAD_AES_128_GCM;
         let mat = KeyingMaterial::new(&vec![0; profile.keying_material_len()]);
@@ -1667,7 +1719,7 @@ mod tests {
 
     #[test]
     fn readiness_valid_rtp_header_keeps_wake_even_without_keys() {
-        let mut session = Session::new(&RtcConfig::default());
+        let mut session = Session::new(&RtcConfig::default(), Instant::now());
         let mut readiness = Readiness::idle();
         // SSRC 0 creates a probe receive stream before the missing-key check.
         let packet = [0x80, 96, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -1679,7 +1731,10 @@ mod tests {
 
     #[test]
     fn readiness_rejected_rtcp_does_not_wake() {
-        for mut session in [Session::new(&RtcConfig::default()), keyed_session()] {
+        for mut session in [
+            Session::new(&RtcConfig::default(), Instant::now()),
+            keyed_session(),
+        ] {
             let before = session.poll_timeout();
             let mut readiness = Readiness::idle();
             session.handle_rtcp_receive(Instant::now(), &[0; 32], &mut readiness.wake());
@@ -1753,11 +1808,11 @@ mod tests {
     #[test]
     fn session_mtu_matches_config() {
         let cfg = RtcConfig::default();
-        let s = Session::new(&cfg);
+        let s = Session::new(&cfg, Instant::now());
         assert_eq!(s.mtu(), DATAGRAM_MTU_TARGET);
 
         let cfg = RtcConfig::default().set_mtu(900..=1280);
-        let s = Session::new(&cfg);
+        let s = Session::new(&cfg, Instant::now());
         assert_eq!(s.mtu(), 900);
     }
 
