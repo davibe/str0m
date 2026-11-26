@@ -342,20 +342,7 @@ concepts are unified into this single value.
    old, and the sender must be in ALR or have left it less than 3 s ago.
    A pending probe result or a congestion gate can suppress the request.
 
-5. **Stagnant Estimate Probing** (str0m addition): When the estimate has
-   remained unchanged (within 5%) for 15+ seconds
-   (`STAGNANT_ESTIMATE_DURATION`) and there's unmet demand (desired >
-   estimate), probes at 2× current estimate (`STAGNANT_PROBE_SCALE`).
-   Rate-limited to once per 15 seconds (`MIN_TIME_BETWEEN_STAGNANT_PROBES`).
-   Only active outside ALR (periodic ALR handles capacity discovery when
-   application-limited). This addresses a deadlock scenario where AIMD
-   recovery stalls: after network capacity is restored, AIMD is capped at
-   1.5× observed throughput while the application sends at 80% or more of
-   estimate—too high to build ALR budget credit but too low for AIMD
-   to make meaningful progress. The stagnation probe provides an escape
-   mechanism by detecting prolonged lack of progress and actively testing
-   for higher capacity. See the function documentation in `probe/control.rs`
-   for detailed analysis of the deadlock scenario.
+Outside ALR, a stable estimate alone does not trigger a probe.
 
 **Gating Rules:**
 
@@ -681,19 +668,9 @@ transmission smoothing and padding generation respectively.
    - **str0m**: Any probe type can lead to exponential probing when its
      result exceeds 70% of the target rate
    - **Impact**: Capacity discovery can continue after large-drop recovery
-     and stagnation probes as well as startup and ALR probes
+     probes as well as startup and ALR probes
 
-2. **Stagnant Estimate Probing:**
-   - **WebRTC**: None (relies on large-drop recovery with ALR requirement, or
-     `WebRTC-BweRapidRecoveryExperiment` field trial to remove ALR requirement)
-   - **str0m**: Automatic stagnation detection and recovery probing
-   - **Reason**: Addresses AIMD deadlock where estimate stagnates after network
-     recovery when send rate is 60-70% of estimate (above ALR threshold but
-     below AIMD effectiveness range)
-   - **Impact**: More robust recovery from network degradation without requiring
-     ALR entry. Probes at 2× estimate after 15s stagnation with 15s rate limit
-
-3. **Padding Strategy:**
+2. **Padding Strategy:**
    - **WebRTC**: Layer/stream requirements and minimum transmit configuration
      supply a padding target, capped by the congestion-controlled rate
    - **str0m**: Configurable minimum transmit target with a 50 kbps floor for
@@ -703,7 +680,7 @@ transmission smoothing and padding generation respectively.
    - **Impact**: Low-rate media can fill toward an application-configured
      traffic target to help discover higher capacity
 
-4. **Bitrate Constraints:**
+3. **Bitrate Constraints:**
    - **WebRTC**: Separate `max_bitrate` (hard cap) and
      `max_total_allocated_bitrate` (allocation sum), probes capped at
      `min(max_bitrate, 2× max_total_allocated_bitrate)`
@@ -714,7 +691,7 @@ transmission smoothing and padding generation respectively.
      probing up to 2× desired rate without a separate hard cap, while WebRTC
      constrains by the minimum of the two values
 
-5. **Periodic ALR Probing:**
+4. **Periodic ALR Probing:**
    - **WebRTC**: Optional periodic ALR probes at 2× current estimate
    - **str0m**: Periodic ALR probes are enabled with BWE and target 2× the current
      estimate after transport feedback arrives, with a minimum interval of
@@ -724,7 +701,7 @@ transmission smoothing and padding generation respectively.
      increase. Allocation probes themselves are triggered by increases in
      desired bitrate, inside or outside ALR
 
-6. **Probe Padding Without Media:**
+5. **Probe Padding Without Media:**
    - **WebRTC**: The referenced `PacketRouter::GeneratePadding` implementation
      obtains padding from RTP modules
    - **str0m**: Prefers media/RTX padding, with a dedicated SSRC 0 source when

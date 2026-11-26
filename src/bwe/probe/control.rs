@@ -30,8 +30,6 @@ const PROBE_UNCERTAINTY: f64 = 0.05;
 const ALR_ENDED_TIMEOUT: Duration = Duration::from_secs(3);
 const MIN_TIME_BETWEEN_ALR_PROBES: Duration = Duration::from_secs(5);
 
-const STAGNATION_INTERVAL: Duration = Duration::from_secs(15);
-
 /// WebRTC: inline `* 2` in probe_controller.cc InitiateProbing().
 /// Allows probing up to 2x max_bitrate to account for bursty streams.
 const MAX_PROBE_BITRATE_FACTOR: f64 = 2.0;
@@ -63,9 +61,6 @@ pub struct ProbeControl {
 
     last_probe: Option<LastProbe>,
 
-    // Baseline for str0m’s stagnation probe, independent of normal estimate updates.
-    stagnation_baseline: Option<(Bitrate, Instant)>,
-    last_stagnation_probe: Option<Instant>,
     large_drop: Option<LargeDrop>,
     last_recovery_request: Option<Instant>,
 
@@ -102,8 +97,6 @@ impl Default for ProbeControl {
             alr_stop: None,
             next_cluster_id: 0.into(),
             last_probe: None,
-            stagnation_baseline: None,
-            last_stagnation_probe: None,
             large_drop: None,
             last_recovery_request: None,
             pending: VecDeque::new(),
@@ -127,8 +120,6 @@ impl ProbeControl {
             self.desired_bitrate = None;
             self.prev_desired = None;
             self.last_probe = None;
-            self.stagnation_baseline = None;
-            self.last_stagnation_probe = None;
             self.large_drop = None;
             self.last_recovery_request = None;
             self.next_timeout = not_happening();
@@ -157,12 +148,6 @@ impl ProbeControl {
 
         if self.last_estimate == Some(v) && self.last_cause == cause {
             return;
-        }
-        if self
-            .stagnation_baseline
-            .is_none_or(|(base, _)| v < base * 0.95 || v > base * 1.05)
-        {
-            self.stagnation_baseline = Some((v, now));
         }
         if let Some(previous) = self.last_estimate {
             if v < previous * BITRATE_DROP_THRESHOLD {
@@ -251,8 +236,7 @@ impl ProbeControl {
         let _ = self.maybe_initial(now, desired, estimate)
             || self.maybe_exponential(now, desired, estimate)
             || self.maybe_allocation(now, desired, prev_desired, estimate)
-            || (process_tick && self.maybe_periodic_alr(now, desired, estimate))
-            || self.maybe_stagnant(now, desired, estimate);
+            || (process_tick && self.maybe_periodic_alr(now, desired, estimate));
 
         // Update timeout based on current state.
         self.next_timeout = self.compute_next_timeout(now);
@@ -448,34 +432,6 @@ impl ProbeControl {
         });
     }
 
-    fn stagnation_deadline(&self) -> Option<Instant> {
-        let (_, since) = self.stagnation_baseline?;
-        if self.in_alr() || self.desired_bitrate? <= self.last_estimate? {
-            return None;
-        }
-        let mut deadline =
-            self.last_stagnation_probe.unwrap_or(since).max(since) + STAGNATION_INTERVAL;
-        if let Some(last) = self.last_probe {
-            if matches!(last.kind, ProbeKind::Initial | ProbeKind::Exponential) {
-                deadline = deadline
-                    .max(last.when + MAX_WAITING_TIME_FOR_PROBING_RESULT + Duration::from_nanos(1));
-            }
-        }
-        Some(deadline)
-    }
-
-    fn maybe_stagnant(&mut self, now: Instant, desired: Bitrate, estimate: Bitrate) -> bool {
-        if self
-            .stagnation_deadline()
-            .is_none_or(|deadline| now < deadline)
-        {
-            return false;
-        }
-        self.queue_probe(estimate * 2.0, ProbeKind::Stagnant, desired, now);
-        self.last_stagnation_probe = Some(now);
-        true
-    }
-
     fn periodic_alr_deadline(&self) -> Option<Instant> {
         self.alr_start
             .map(|start| self.last_when().unwrap_or(start).max(start) + MIN_TIME_BETWEEN_ALR_PROBES)
@@ -496,7 +452,7 @@ impl ProbeControl {
             return Self::process_tick_after(tick, deadline - Duration::from_nanos(1));
         }
 
-        self.stagnation_deadline().unwrap_or_else(not_happening)
+        not_happening()
     }
 
     fn can_probe(&self, estimate: Bitrate) -> bool {
@@ -1113,7 +1069,7 @@ mod test {
     }
 
     #[test]
-    fn stable_estimate_outside_alr_probes_every_fifteen_seconds() {
+    fn stable_estimate_outside_alr_does_not_start_a_probe() {
         let start = Instant::now();
         let mut pc = ProbeControl::new();
         pc.enable(true);
@@ -1125,16 +1081,14 @@ mod test {
         );
         pc.handle_timeout(start).unwrap();
         pc.handle_timeout(start).unwrap();
-        assert!(pc.handle_timeout(start + Duration::from_secs(2)).is_none());
-        for seconds in [15, 30] {
-            let due = start + Duration::from_secs(seconds);
-            assert_eq!(pc.poll_timeout(), due);
-            assert!(pc.handle_timeout(due - Duration::from_millis(1)).is_none());
-            let probe = pc.handle_timeout(due).unwrap();
-            assert_eq!(pc.last_probe.unwrap().kind, ProbeKind::Stagnant);
-            assert_eq!(probe.target_bitrate(), Bitrate::kbps(792));
-            assert!(pc.handle_timeout(due).is_none());
+        for seconds in [2, 15, 16, 30, 40] {
+            pc.set_desired_bitrate(Bitrate::mbps(3));
+            assert!(
+                pc.handle_timeout(start + Duration::from_secs(seconds))
+                    .is_none()
+            );
         }
+        assert_eq!(pc.poll_timeout(), not_happening());
     }
 
     #[test]
