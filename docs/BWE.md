@@ -457,6 +457,9 @@ recently-finished probes, allowing estimates to be refined as additional
 feedback trickles in. After 1 second past the last received packet, the
 cluster state is erased to prevent unbounded memory growth.
 
+Probe feedback is processed in receive order. For tied timestamps the
+boundary packet matters because its bytes are excluded from the rate.
+
 The calculation computes both send rate (send_size divided by send_interval
 from TWCC local_send_time) and receive rate (recv_size divided by
 recv_interval from TWCC remote_recv_time). It validates that recv_rate /

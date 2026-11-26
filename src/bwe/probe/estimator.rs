@@ -145,11 +145,12 @@ impl ProbeEstimator {
         // Keep track of which clusters were updated in this call.
         self.results.clear();
 
-        for record in records {
-            let Some(cluster) = record.cluster() else {
-                continue;
-            };
-
+        // GoogCC feeds its probe estimator TransportPacketsFeedback::SortedByReceiveTime.
+        let mut received: Vec<_> = records
+            .filter_map(|record| Some((record.remote_recv_time()?, record.cluster()?, record)))
+            .collect();
+        received.sort_unstable_by_key(|(arrival, _, r)| (*arrival, r.local_send_time(), r.seq()));
+        for (_, cluster, record) in received {
             // Find the state for this cluster.
             let maybe_state = self
                 .states
@@ -256,16 +257,13 @@ impl ProbeEstimatorState {
         let first = self.first_send_time.get_or_insert(send_time);
         *first = (*first).min(send_time);
 
-        let last = self.last_send_time.get_or_insert(send_time);
-        if send_time >= *last {
-            *last = send_time;
+        if self.last_send_time.is_none_or(|last| send_time > last) {
+            self.last_send_time = Some(send_time);
             self.size_last_send = packet_size;
         }
 
-        // Track min/max receive time among included packets.
-        let first_recv = self.first_recv_time.get_or_insert(recv_time);
-        if recv_time <= *first_recv {
-            *first_recv = recv_time;
+        if self.first_recv_time.is_none_or(|first| recv_time < first) {
+            self.first_recv_time = Some(recv_time);
             self.size_first_receive = packet_size;
         }
 
@@ -555,6 +553,28 @@ mod test {
             estimate_only_received, estimate_with_lost,
             "lost packets must not change probe estimate"
         );
+    }
+
+    #[test]
+    fn coincident_probe_packets_keep_first_boundary_size_in_receive_order() {
+        let now = Instant::now();
+        let cluster = 1.into();
+        let config = ProbeClusterConfig::new(cluster, Bitrate::mbps(1), ProbeKind::Initial);
+        let mut estimator = ProbeEstimator::new();
+        assert!(estimator.probe_start(config, now));
+        let packets = [(2_u64, 1200), (1, 200)].map(|(seq, size)| {
+            TwccSendRecord::test_new(
+                TwccPacketId::with_cluster(seq, cluster),
+                now,
+                size,
+                now,
+                Some(now),
+            )
+        });
+        estimator.update(packets.iter()).count();
+        let state = &estimator.states[0];
+        assert_eq!(state.size_last_send, DataSize::bytes(200));
+        assert_eq!(state.size_first_receive, DataSize::bytes(200));
     }
 
     #[test]

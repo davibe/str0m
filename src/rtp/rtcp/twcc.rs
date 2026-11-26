@@ -67,6 +67,18 @@ pub struct TwccIter {
     twcc: Twcc,
 }
 
+// TransportFeedbackAdapter::ProcessTransportFeedback converts the cumulative
+// delta from the report base to whole milliseconds for each received packet.
+// Keep the raw TWCC iterator at wire precision so rounding never accumulates.
+fn feedback_arrival_ms(base: Instant, arrival: Instant) -> Instant {
+    let truncate_to_ms = |d: Duration| Duration::from_millis(d.as_millis() as u64);
+    if arrival >= base {
+        base + truncate_to_ms(arrival - base)
+    } else {
+        base - truncate_to_ms(base - arrival)
+    }
+}
+
 impl Iterator for TwccIter {
     type Item = (TwccSeq, PacketStatus, Option<Instant>);
 
@@ -281,6 +293,13 @@ impl TwccRecvRegister {
             time_start: None,
             generated_reports: 0,
             receive_window: ReceiveWindow::default(),
+        }
+    }
+
+    pub(crate) fn with_clock_origin(keep_reported: usize, origin: Instant) -> Self {
+        Self {
+            time_start: Some(origin),
+            ..Self::new(keep_reported)
         }
     }
 
@@ -570,25 +589,23 @@ fn build_interims(
             dur.as_micros() as i64
         };
 
-        let (status, time) = if diff_time < -8_192_000 || diff_time > 8_191_750 {
-            // This is too large to be representable in deltas.
-            // Abort, make a report of what we got, and start anew.
+        // TransportFeedback::AddReceivedPacket rounds signed deltas to the
+        // nearest 250 µs before choosing their encoded size.
+        let ticks = (diff_time + diff_time.signum() * 125) / 250;
+        let Ok(time) = i16::try_from(ticks) else {
             break;
-        } else if diff_time < 0 || diff_time > 63_750 {
-            let t = diff_time / 250;
-            assert!(t >= -32_768 && t <= 32_767);
-            (PacketStatus::ReceivedLargeOrNegativeDelta, t as i16)
+        };
+        let status = if u8::try_from(time).is_ok() {
+            PacketStatus::ReceivedSmallDelta
         } else {
-            let t = diff_time / 250;
-            assert!(t >= 0 && t <= 255);
-            (PacketStatus::ReceivedSmallDelta, t as i16)
+            PacketStatus::ReceivedLargeOrNegativeDelta
         };
 
         interims.push_back(ChunkInterim::Received(status, time));
 
         // The next delta is relative to the time this delta REPORTS, not the
         // true receive time: the receiver of the report sums the deltas, so
-        // carrying r.time would let each delta's truncation (up to 250us)
+        // carrying r.time would let each delta's rounding error
         // accumulate across the report.
         let reported = Duration::from_micros(250 * time.unsigned_abs() as u64);
         let reported_time = if time < 0 {
@@ -1248,8 +1265,16 @@ impl TwccSendRegister {
         let time_zero = self.time_zero.unwrap();
         let head_seq = self.queue.front().map(|r| r.seq())?;
 
-        let mut iter = twcc
-            .into_iter(time_zero, self.last_registered)
+        let iter = twcc.into_iter(time_zero, self.last_registered);
+        let report_base = iter.time_base;
+        let mut iter = iter
+            .map(|(seq, status, at)| {
+                (
+                    seq,
+                    status,
+                    at.map(|at| feedback_arrival_ms(report_base, at)),
+                )
+            })
             .skip_while(|(seq, _, _)| seq < &head_seq);
         let (first_seq_no, _, first_instant) = iter.next()?;
 
@@ -1526,6 +1551,22 @@ mod test {
     use PacketStatus::*;
 
     #[test]
+    fn feedback_adapter_truncates_cumulative_receive_delta_to_milliseconds() {
+        let base = std::time::Instant::now();
+        let us = Duration::from_micros;
+        for (delta, expected) in [(750, 0), (1250, 1000), (2000, 2000)] {
+            assert_eq!(
+                super::feedback_arrival_ms(base, base + us(delta)),
+                base + us(expected)
+            );
+            assert_eq!(
+                super::feedback_arrival_ms(base, base - us(delta)),
+                base - us(expected)
+            );
+        }
+    }
+
+    #[test]
     fn register_write_parse_small_delta() {
         let mut reg = TwccRecvRegister::new(100);
 
@@ -1769,6 +1810,51 @@ mod test {
     }
 
     #[test]
+    fn report_uses_receiver_clock_and_rounds_positive_and_negative_half_ticks() {
+        let origin = Instant::now();
+        let mut reg = TwccRecvRegister::with_clock_origin(100, origin);
+        for (seq, us) in [65_125, 64_875].into_iter().enumerate() {
+            reg.update_seq((seq as u64).into(), origin + Duration::from_micros(us));
+        }
+        let report = reg.build_report(1500).unwrap();
+        assert_eq!(report.reference_time, 1);
+        assert_eq!(
+            reported_times(report, origin),
+            [
+                origin + Duration::from_micros(65_250),
+                origin + Duration::from_micros(64_750),
+            ]
+        );
+    }
+
+    #[test]
+    fn feedback_adapter_keeps_submillisecond_deltas_until_after_accumulation() {
+        let origin = Instant::now();
+        let mut rx = TwccRecvRegister::with_clock_origin(20, origin);
+        let mut tx = TwccSendRegister::new(20);
+        for seq in 0..4 {
+            tx.register_seq(TwccPacketId::new(seq), origin, 100);
+            rx.update_seq(seq.into(), origin + Duration::from_micros(250 * (seq + 1)));
+        }
+        let report = rx.build_report(1500).unwrap();
+        let at = origin + Duration::from_millis(10);
+        let offsets: Vec<_> = tx
+            .apply_report(report, at)
+            .unwrap()
+            .map(|record| record.remote_recv_time().unwrap() - at)
+            .collect();
+        assert_eq!(
+            offsets,
+            [
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::from_millis(1)
+            ]
+        );
+    }
+
+    #[test]
     fn report_deltas_do_not_accumulate_truncation() {
         let mut reg = TwccRecvRegister::new(200);
         let now = Instant::now();
@@ -1788,8 +1874,8 @@ mod test {
         let reported = reported_times(report, now);
         assert_eq!(reported.len(), truth.len());
         for (t, r) in truth.iter().zip(&reported) {
-            assert!(*r <= *t, "never reported later than received");
-            assert!(*t - *r < Duration::from_micros(250), "off by {:?}", *t - *r);
+            let error = (*t).max(*r) - (*t).min(*r);
+            assert!(error <= Duration::from_micros(125), "off by {error:?}");
         }
     }
 

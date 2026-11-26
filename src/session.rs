@@ -94,6 +94,8 @@ pub(crate) struct Session {
     srtp_rx: Option<SrtpContext>,
     srtp_tx: Option<SrtpContext>,
     last_nack: Instant,
+    /// Local origin for millisecond timestamps in the send history.
+    send_clock_origin: Instant,
     /// Local deadline for the next periodic feedback report.
     next_twcc: Instant,
     /// Current spacing between periodic feedback reports.
@@ -204,10 +206,11 @@ impl Session {
             srtp_rx: None,
             srtp_tx: None,
             last_nack: already_happened(),
+            send_clock_origin: start,
             next_twcc: start + TWCC_INTERVAL,
             twcc_interval: TWCC_INTERVAL,
             twcc: 0,
-            twcc_rx_register: TwccRecvRegister::new(100),
+            twcc_rx_register: TwccRecvRegister::with_clock_origin(100, start),
             twcc_tx_register: TwccSendRegister::new(1000),
             max_rx_seq_lookup: HashMap::new(),
             bwe,
@@ -1304,15 +1307,20 @@ impl Session {
             } else {
                 TwccPacketId::new(twcc_seq)
             };
+            // SentPacketInfo exposes whole milliseconds to the native feedback
+            // adapter. Keep the pacer clock at full precision.
+            // Timestamp::ms() rounds to nearest when constructing SentPacketInfo.
+            let elapsed = now.saturating_duration_since(self.send_clock_origin);
+            let sent_at = self.send_clock_origin
+                + Duration::from_millis(((elapsed.as_micros() + 500) / 1000) as u64);
             self.twcc_tx_register
-                .register_seq(packet_id, now, payload_size);
+                .register_seq(packet_id, sent_at, payload_size);
+            if let Some(bwe) = &mut self.bwe {
+                bwe.on_twcc_packet_sent(sent_at);
+            }
         }
 
-        // Update BWE subsystem
         if let Some(bwe) = self.bwe.as_mut() {
-            if twcc_enabled {
-                bwe.on_twcc_packet_sent(now);
-            }
             bwe.on_media_sent(payload_size.into(), is_padding, now);
         }
 
