@@ -68,7 +68,7 @@ digraph BWE_DataFlow {
 
     // ALR system flows
     ALR -> PC [label="ALR state\n(start time)"];
-    SSBE -> ALR [label="media sent"];
+    SSBE -> ALR [label="TWCC RTP bytes sent"];
 
     // Pacer control
     PacerCtrl -> Pacer [label="pacing_rate\npadding_rate"];

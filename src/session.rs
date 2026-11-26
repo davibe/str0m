@@ -1365,6 +1365,9 @@ impl Session {
             } else {
                 TwccPacketId::new(twcc_seq)
             };
+            // Transport feedback describes the entire RTP packet, including its
+            // header and padding. SRTP and UDP/IP overhead are excluded.
+            let rtp_size = buf.len();
             // SentPacketInfo exposes whole milliseconds to the native feedback
             // adapter. Keep the pacer clock at full precision.
             // Timestamp::ms() rounds to nearest when constructing SentPacketInfo.
@@ -1372,15 +1375,11 @@ impl Session {
             let sent_at = self.send_clock_origin
                 + Duration::from_millis(((elapsed.as_micros() + 500) / 1000) as u64);
             self.twcc_tx_register
-                .register_seq(packet_id, sent_at, payload_size);
+                .register_seq(packet_id, sent_at, rtp_size);
             if let Some(bwe) = &mut self.bwe {
                 bwe.set_outstanding_bytes(self.twcc_tx_register.outstanding_bytes());
-                bwe.on_twcc_packet_sent(sent_at);
+                bwe.on_twcc_packet_sent(sent_at, rtp_size.into());
             }
-        }
-
-        if let Some(bwe) = self.bwe.as_mut() {
-            bwe.on_media_sent(payload_size.into(), is_padding, now);
         }
 
         if !is_padding && !header.ssrc.is_probe() {

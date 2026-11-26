@@ -513,7 +513,10 @@ entry/exit, disrupting probe scheduling and loss estimation.
 These defaults come from libwebrtc’s `WebRTC-ProbingScreenshareBwe` field trial,
 enabled by default since 2019.
 
-The detector charges media payload bytes and excludes padding. The ALR state controls eligibility for
+The detector charges every TWCC-tracked RTP packet, including RTP headers
+and padding. Applications selecting an encoder payload rate should allow
+for packet overhead and
+other traffic sharing that budget. The ALR state controls eligibility for
 periodic and recovery probes.
 
 While probing is available, the budget can advance with zero bytes after

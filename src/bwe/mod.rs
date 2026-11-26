@@ -126,15 +126,10 @@ impl Bwe {
         self.bwe.window.outstanding = bytes;
     }
 
-    pub fn on_media_sent(&mut self, payload_size: DataSize, is_padding: bool, now: Instant) {
-        if !is_padding {
-            self.bwe.alr_detector.on_bytes_sent(payload_size, now);
-        }
-    }
-
-    pub fn on_twcc_packet_sent(&mut self, now: Instant) {
+    pub fn on_twcc_packet_sent(&mut self, now: Instant, size: DataSize) {
         self.bwe.update_encoder_target(now);
         self.bwe.rtt_backoff.on_packet_sent(now);
+        self.bwe.alr_detector.on_bytes_sent(size, now);
     }
 
     pub fn has_transport_feedback(&self) -> bool {
@@ -633,12 +628,12 @@ mod test {
         let start = Instant::now();
         let at = |ms| start + Duration::from_millis(ms);
         let mut bwe = Bwe::new(Bitrate::kbps(100));
-        bwe.on_twcc_packet_sent(start);
-        bwe.on_twcc_packet_sent(at(3000));
+        bwe.on_twcc_packet_sent(start, DataSize::bytes(240));
+        bwe.on_twcc_packet_sent(at(3000), DataSize::bytes(240));
         bwe.handle_timeout(at(3500), false);
         assert_eq!(bwe.last_estimate(), Some(Bitrate::kbps(100)));
 
-        bwe.on_twcc_packet_sent(at(3501));
+        bwe.on_twcc_packet_sent(at(3501), DataSize::bytes(240));
         bwe.handle_timeout(at(3501), false);
         assert_eq!(bwe.last_estimate(), Some(Bitrate::kbps(80)));
         let lost = TwccSendRecord::test_new(TwccPacketId::new(1u64), start, 240, at(4500), None);
@@ -648,7 +643,7 @@ mod test {
         bwe.handle_timeout(at(4501), false);
         assert_eq!(bwe.last_estimate(), Some(Bitrate::kbps(64)));
 
-        bwe.on_twcc_packet_sent(at(4502));
+        bwe.on_twcc_packet_sent(at(4502), DataSize::bytes(240));
         let ack = TwccSendRecord::test_new(
             TwccPacketId::new(2u64),
             at(4502),

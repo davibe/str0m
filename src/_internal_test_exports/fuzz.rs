@@ -266,7 +266,7 @@ pub fn twcc(data: &[u8]) -> Option<()> {
                         _ => TwccPacketId::new(next_seq),
                     };
                     send.register_seq(id, now, size);
-                    bwe.on_twcc_packet_sent(now);
+                    bwe.on_twcc_packet_sent(now, size.into());
                     next_seq += 1;
                 }
             }
