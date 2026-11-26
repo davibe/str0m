@@ -110,7 +110,15 @@ impl Bwe {
         self.bwe.last_estimate()
     }
 
+    pub fn update_reported_loss(&mut self, expected: i64, lost: i64) {
+        self.bwe.reported_loss.update(expected, lost);
+    }
+
     pub fn update_rtt(&mut self, rtt: Duration) {
+        let ms = ((rtt.as_micros() + 500) / 1000) as u64;
+        if ms > 0 {
+            self.bwe.reported_rtt = Duration::from_millis(ms);
+        }
         self.bwe.delay_controller.update_rtt(rtt);
     }
 
@@ -147,6 +155,39 @@ impl Bwe {
     }
 }
 
+#[derive(Default)]
+struct ReportedLoss {
+    expected: i64,
+    lost: i64,
+    fraction: u8,
+}
+
+impl ReportedLoss {
+    fn update(&mut self, expected: i64, lost: i64) {
+        if expected <= 0 || expected <= lost {
+            return;
+        }
+        self.expected += expected;
+        self.lost += lost;
+        // SendSideBandwidthEstimation::UpdatePacketsLost uses Q8 over at least 20 packets.
+        if self.expected >= 20 {
+            self.fraction = ((self.lost.max(0) * 256 / self.expected).min(255)) as u8;
+            self.expected = 0;
+            self.lost = 0;
+        }
+    }
+}
+
+#[derive(PartialEq)]
+struct NetworkState {
+    rate: Bitrate,
+    in_alr: bool,
+    encoder_target: Option<Bitrate>,
+    loss_state: LossControllerState,
+    fraction_loss: u8,
+    rtt: Duration,
+}
+
 struct SendSideBandwidthEstimator {
     rtt_backoff: RttBasedBackoff,
     delay_controller: DelayController,
@@ -159,7 +200,9 @@ struct SendSideBandwidthEstimator {
     alr_detector: AlrDetector,
     window: congestion_window::CongestionWindow,
     encoder_target: Option<Bitrate>,
-    last_propagated: Option<(Bitrate, bool, Option<Bitrate>)>,
+    reported_loss: ReportedLoss,
+    reported_rtt: Duration,
+    last_propagated: Option<NetworkState>,
 }
 
 #[derive(Default)]
@@ -248,6 +291,8 @@ impl SendSideBandwidthEstimator {
             alr_detector,
             window: Default::default(),
             encoder_target: None,
+            reported_loss: ReportedLoss::default(),
+            reported_rtt: Duration::ZERO,
             last_propagated: None,
         }
     }
@@ -421,26 +466,32 @@ impl SendSideBandwidthEstimator {
         let Some(estimate) = self.last_estimate() else {
             return;
         };
-        // GoogCC also refreshes the probe controller's stored cause on ALR transitions.
-        let rate_and_alr = (
-            estimate,
-            self.alr_detector.alr_start_time().is_some(),
-            self.encoder_target,
-        );
-        if self.last_propagated == Some(rate_and_alr) {
+        let state = NetworkState {
+            rate: estimate,
+            in_alr: self.alr_detector.alr_start_time().is_some(),
+            encoder_target: self.encoder_target,
+            loss_state: if self.loss_controller.is_ready() {
+                self.loss_controller.loss_based_result().state
+            } else {
+                LossControllerState::DelayBased
+            },
+            fraction_loss: self.reported_loss.fraction,
+            rtt: self.reported_rtt,
+        };
+        if self.last_propagated.as_ref() == Some(&state) {
             return;
         }
 
-        let cause = self.bandwidth_limited_cause();
+        let cause = self.bandwidth_limited_cause(state.loss_state);
 
         self.probe_control
             .set_estimated_bitrate(now, estimate, cause);
         self.alr_detector.set_estimated_bitrate(estimate);
 
-        self.last_propagated = Some(rate_and_alr);
+        self.last_propagated = Some(state);
     }
 
-    fn bandwidth_limited_cause(&self) -> BandwidthLimitedCause {
+    fn bandwidth_limited_cause(&self, loss_state: LossControllerState) -> BandwidthLimitedCause {
         if self.delay_controller.usage() != BandwidthUsage::Normal {
             return BandwidthLimitedCause::DelayBasedLimitedDelayIncreased;
         }
@@ -449,7 +500,7 @@ impl SendSideBandwidthEstimator {
             return BandwidthLimitedCause::RttBasedBackoff;
         }
 
-        match self.loss_controller.loss_based_result().state {
+        match loss_state {
             LossControllerState::DelayBased => BandwidthLimitedCause::DelayBasedLimited,
             LossControllerState::Increasing => BandwidthLimitedCause::LossLimitedBweIncreasing,
             LossControllerState::Decreasing => BandwidthLimitedCause::LossLimitedBwe,
@@ -562,6 +613,20 @@ impl fmt::Display for BandwidthUsage {
 mod test {
     use super::*;
     use crate::rtp_::TwccPacketId;
+
+    #[test]
+    fn receiver_report_loss_uses_signed_deltas_and_a_twenty_packet_window() {
+        let mut loss = ReportedLoss::default();
+        loss.update(10, 3);
+        loss.update(9, -1);
+        assert_eq!(loss.fraction, 0);
+        loss.update(1, 0);
+        assert_eq!(loss.fraction, 25); // floor(2/20 * 256)
+        loss.update(20, 20); // No received packets: ignore the report.
+        assert_eq!(loss.fraction, 25);
+        loss.update(20, -1);
+        assert_eq!(loss.fraction, 0);
+    }
 
     #[test]
     fn rtt_backoff_tracks_sends_during_feedback_silence_and_recovers() {

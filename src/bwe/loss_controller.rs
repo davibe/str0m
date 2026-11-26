@@ -1084,6 +1084,37 @@ mod test {
     }
 
     #[test]
+    fn probe_network_state_uses_the_ready_loss_state_at_constant_rate() {
+        use super::super::SendSideBandwidthEstimator;
+
+        let now = Instant::now();
+        let rate = Bitrate::kbps(300);
+        let mut bwe = SendSideBandwidthEstimator::new(rate);
+        bwe.loss_controller.set_bandwidth_estimate(rate);
+        bwe.loss_controller
+            .set_state(LossControllerState::Decreasing);
+        bwe.propagate_estimate(now);
+        assert_eq!(
+            bwe.last_propagated.as_ref().unwrap().loss_state,
+            LossControllerState::DelayBased
+        );
+        bwe.loss_controller.num_observations = 3;
+        bwe.propagate_estimate(now);
+        assert_eq!(
+            bwe.last_propagated.as_ref().unwrap().loss_state,
+            LossControllerState::Decreasing
+        );
+        bwe.loss_controller
+            .set_state(LossControllerState::Increasing);
+        bwe.propagate_estimate(now);
+        assert_eq!(
+            bwe.last_propagated.as_ref().unwrap().loss_state,
+            LossControllerState::Increasing
+        );
+        assert_eq!(bwe.last_estimate(), Some(rate));
+    }
+
+    #[test]
     fn delay_cap_preserves_internal_acked_rate_lower_bound() {
         use super::super::SendSideBandwidthEstimator;
         use crate::rtp_::{TwccPacketId, TwccSendRecord};

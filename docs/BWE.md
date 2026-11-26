@@ -359,6 +359,9 @@ concepts are unified into this single value.
 
 **Gating Rules:**
 
+At an unchanged bitrate, a change in reported RTT, loss fraction or loss-controller
+state can refresh the cause used to decide whether a probe is allowed.
+
 The controller blocks probing based on `BandwidthLimitedCause` state to
 avoid making congestion worse:
 

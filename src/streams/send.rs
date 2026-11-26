@@ -166,6 +166,7 @@ pub struct StreamTx {
     ///
     /// Stats are use to calculate the rtx ratio also when statistics events are disabled.
     stats: StreamTxStats,
+    previous_loss_report: Option<(u32, i32)>,
 
     // downsampled rtx ratio (value, last calculation)
     rtx_ratio: (f32, Instant),
@@ -392,6 +393,7 @@ impl StreamTx {
             pending_request_keyframe: None,
             pending_request_remb: None,
             stats: StreamTxStats::new(enable_stats),
+            previous_loss_report: None,
             rtx_ratio: (0.0, already_happened()),
             pt_for_padding: None,
             remote_acked_ssrc: false,
@@ -1039,6 +1041,18 @@ impl StreamTx {
 
     pub(crate) fn poll_remb_request(&mut self) -> Option<Bitrate> {
         self.pending_request_remb.take()
+    }
+
+    pub(crate) fn report_loss_delta(&mut self, max_seq: u32, cumulative: u32) -> (i64, i64) {
+        // RTCP encodes cumulative loss as a signed 24-bit integer.
+        let lost = ((cumulative << 8) as i32) >> 8;
+        let previous = self.previous_loss_report.replace((max_seq, lost));
+        previous.map_or((0, 0), |(seq, prev_lost)| {
+            (
+                i64::from(max_seq.wrapping_sub(seq) as i32),
+                i64::from(lost - prev_lost),
+            )
+        })
     }
 
     pub(crate) fn reported_rtt(&self) -> Option<Duration> {
@@ -1759,6 +1773,13 @@ mod test {
             }),
             now + Duration::from_millis(750)
         );
+    }
+
+    #[test]
+    fn receiver_report_deltas_handle_sequence_wrap_and_negative_loss() {
+        let mut stream = StreamTx::new(42.into(), None, MidRid(Mid::from("0"), None), false, 1200);
+        assert_eq!(stream.report_loss_delta(u32::MAX, 1), (0, 0));
+        assert_eq!(stream.report_loss_delta(19, 0x00ff_ffff), (20, -2));
     }
 
     #[test]

@@ -974,6 +974,27 @@ impl Session {
             }
         }
 
+        if let Some(bwe) = &mut self.bwe {
+            // Aggregate report blocks across SSRCs before applying the loss sample.
+            let mut expected = 0;
+            let mut lost = 0;
+            for packet in &self.feedback_rx {
+                let reports = match packet {
+                    Rtcp::SenderReport(sr) => &sr.reports,
+                    Rtcp::ReceiverReport(rr) => &rr.reports,
+                    _ => continue,
+                };
+                for report in reports {
+                    if let Some(stream) = self.streams.stream_tx(&report.ssrc) {
+                        let delta = stream.report_loss_delta(report.max_seq, report.packets_lost);
+                        expected += delta.0;
+                        lost += delta.1;
+                    }
+                }
+            }
+            bwe.update_reported_loss(expected, lost);
+        }
+
         for fb in RtcpFb::from_rtcp(self.feedback_rx.drain(..)) {
             if let RtcpFb::AppSpecificFeedback(asf) = fb {
                 self.pending_app_feedback = Some(AppSpecificFeedback {

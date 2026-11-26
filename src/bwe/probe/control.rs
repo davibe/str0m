@@ -607,6 +607,29 @@ mod test {
     use super::*;
 
     #[test]
+    fn receiver_report_changes_refresh_recovery_eligibility_at_constant_rate() {
+        use crate::bwe_::Bwe;
+
+        let now = Instant::now();
+        let rate = Bitrate::kbps(300);
+        let mut bwe = Bwe::new(rate);
+        bwe.bwe.propagate_estimate(now);
+        assert!(bwe.bwe.probe_control.can_probe(rate));
+        bwe.bwe.rtt_backoff.target = Some(rate);
+        bwe.update_rtt(Duration::from_micros(50_100));
+        bwe.bwe.propagate_estimate(now);
+        assert!(!bwe.bwe.probe_control.can_probe(rate));
+        bwe.bwe.rtt_backoff.target = None;
+        bwe.update_rtt(Duration::from_micros(50_200)); // Same millisecond.
+        bwe.bwe.propagate_estimate(now);
+        assert!(!bwe.bwe.probe_control.can_probe(rate));
+        bwe.update_reported_loss(20, 1);
+        bwe.bwe.propagate_estimate(now);
+        assert!(bwe.bwe.probe_control.can_probe(rate));
+        assert_eq!(bwe.last_estimate(), Some(rate));
+    }
+
+    #[test]
     fn leaving_alr_refreshes_probe_cause_at_an_unchanged_rate() {
         use crate::bwe_::SendSideBandwidthEstimator;
         use crate::rtp_::DataSize;
