@@ -206,20 +206,16 @@ due to overuse).
 On a decrease, the controller takes 85% of the observed throughput and
 rounds to the nearest bit/s. If the result exceeds 5 kbit/s, it subtracts
 another 5 kbit/s to help drain queues at low rates. It caps the result at
-the current estimate, applies the configured bitrate bounds, and enters Hold.
+the current estimate. If the calculated rate would exceed the current estimate,
+it can use 85% of the tracked link capacity for the reduction. It then
+applies the configured bitrate bounds and enters Hold.
 Repeated reductions are normally spaced by one RTT, clamped to 10–200 ms.
 Throughput below half the current estimate can trigger an earlier reduction.
 
-During the Increase state, the controller's behavior depends on
-convergence proximity. When the estimate is within 3 standard deviations
-of the observed average bitrate, it switches to additive increase mode,
-growing cautiously near the perceived capacity to avoid overshooting into
-congestion. Far from convergence, it uses multiplicative increase with a
-coefficient of 1.08 raised to time (`MULTIPLICATIVE_INCREASE_COEF`),
-allowing faster exploration of available bandwidth when we're well below
-capacity. Regardless of mode, increases are capped at 1.5× the observed
-throughput (`MAX_ESTIMATE_RATIO`) to prevent runaway growth beyond what the
-network can actually deliver.
+Overuse samples provide a link-capacity estimate. While that estimate is
+valid, AIMD increases additively at a rate that depends on RTT and packet
+size. Otherwise it increases multiplicatively. Growth is capped at
+1.5 × acknowledged throughput + 10 kbit/s.
 
 The resulting estimated bitrate flows back to the DelayController, which
 forwards it to the SendSideBandwidthEstimator for final bandwidth
