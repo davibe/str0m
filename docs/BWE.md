@@ -485,13 +485,11 @@ probe's packets. The estimator implements WebRTC's streaming probe
 estimation model where results are calculated continuously as feedback
 arrives rather than waiting for a fixed period.
 
-The estimator lifecycle works as follows: `probe_start()` begins watching
-for the cluster_id in TWCC feedback, `update()` accumulates received
-packets while ignoring lost ones (lost probe packets indicate congestion,
-making the probe result invalid) and immediately yields any new probe
-results, `end_probe()` is called when the Pacer finishes sending and marks
-the probe for cleanup, and finally `handle_timeout()` removes stale probe
-state after the cluster history period expires.
+For each cluster, `update()` returns the last valid measurement in the
+feedback report. It skips packets reported as lost and keeps an earlier
+valid measurement if a later packet produces an unusable sample.
+After the pacer finishes sending, the estimator can still process late
+feedback until the cluster history expires.
 
 WebRTC uses `kMaxClusterHistory` (1 second) as "the maximum time period
 beyond which a probing burst is not expected to last." This is not a "wait
