@@ -135,13 +135,9 @@ time variations. This is the primary congestion detection mechanism.
 1. Groups packets into arrival groups (via `ArrivalGroupAccumulator`)
 2. Calculates inter-group delay variations
 3. Feeds delay variations to trendline estimator
-4. Maintains smoothed RTT using EWMA with α = 1/8 (RFC 6298), matching
-   WebRTC's approach where each controller calculates its own smoothed RTT
-   rather than relying on externally-provided values
-5. Uses rate control (AIMD) to adjust bandwidth estimate at regular
-   intervals (`UPDATE_INTERVAL` = 25ms)
-6. Invalidates the trendline hypothesis if no TWCC feedback received for
-   more than 2× smoothed RTT (capped at `MAX_TWCC_GAP` = 500ms)
+4. Updates AIMD when transport feedback acknowledges packets. Delay overuse
+   takes precedence over a probe result in the same feedback batch.
+5. Uses RTCP receiver-report RTT for rate control, initially 200 ms.
 
 The controller produces a delay-based bandwidth estimate along with an
 overuse state signal, both of which flow to the SendSideBandwidthEstimator
@@ -230,10 +226,8 @@ On a decrease, the controller takes 85% of the observed throughput and
 rounds to the nearest bit/s. If the result exceeds 5 kbit/s, it subtracts
 another 5 kbit/s to help drain queues at low rates. It caps the result at
 the current estimate, applies the configured bitrate bounds, and enters Hold.
-The controller remains in Hold state for a period before allowing increases
-again, implementing a guard time called TimeToReduceFurther (1 RTT clamped
-between 10-200ms). This waiting period ensures the network has time to
-drain queues and stabilize before we attempt to grow again.
+Repeated reductions are normally spaced by one RTT, clamped to 10–200 ms.
+Throughput below half the current estimate can trigger an earlier reduction.
 
 During the Increase state, the controller's behavior depends on
 convergence proximity. When the estimate is within 3 standard deviations
