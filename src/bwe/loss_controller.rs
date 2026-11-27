@@ -83,12 +83,6 @@ pub struct LossController {
 
     /// HOLD mechanism state - prevents immediate ramp-up after loss
     last_hold_info: HoldInfo,
-
-    /// ALR start time (None if not in ALR)
-    alr_start_time: Option<Instant>,
-
-    /// Link capacity estimate from probes during ALR
-    link_capacity_estimate: Option<Bitrate>,
 }
 
 /// State of the Loss Controller
@@ -143,9 +137,6 @@ impl LossController {
 
             last_hold_info: HoldInfo::default(),
 
-            alr_start_time: None,
-            link_capacity_estimate: None,
-
             config,
         };
 
@@ -175,21 +166,6 @@ impl LossController {
     /// Update the acknowledged bitrate based on TWCC feedback.
     pub fn set_acknowledged_bitrate(&mut self, acknowledged_bitrate: Bitrate) {
         self.acknowledged_bitrate = acknowledged_bitrate;
-    }
-
-    /// Set ALR start time from the ALR detector.
-    pub fn set_alr_start_time(&mut self, alr_start: Option<Instant>) {
-        self.alr_start_time = alr_start;
-    }
-
-    /// Set link capacity estimate from successful ALR probes.
-    pub fn set_link_capacity_estimate(&mut self, capacity: Option<Bitrate>) {
-        self.link_capacity_estimate = capacity;
-    }
-
-    /// Check if currently in ALR state
-    fn is_in_alr(&self) -> bool {
-        self.alr_start_time.is_some()
     }
 
     pub fn is_ready(&self) -> bool {
@@ -673,16 +649,6 @@ impl LossController {
     fn get_candidate_bandwidth_upper_bound(&self) -> Bitrate {
         let mut upper_bound = self.max_bitrate;
 
-        // When in ALR and we have a link capacity estimate from probes,
-        // use it as the upper bound. This prevents estimating beyond proven capacity.
-        if self.is_in_alr() {
-            if let Some(capacity) = self.link_capacity_estimate {
-                if capacity.is_valid() {
-                    upper_bound = upper_bound.min(capacity);
-                }
-            }
-        }
-
         if self.is_bandwidth_limited_due_to_loss()
             && self.bandwidth_limit_in_current_window.is_valid()
         {
@@ -1104,6 +1070,16 @@ mod test {
 
         fn lost(&self) -> bool {
             self.lost
+        }
+    }
+
+    #[test]
+    fn delay_based_candidate_can_follow_a_second_larger_probe() {
+        let mut controller = LossController::new();
+        for kbps in [1250, 2500, 5000] {
+            let rate = Bitrate::kbps(kbps);
+            controller.delay_based_estimate = rate;
+            assert_eq!(controller.get_candidate_bandwidth_upper_bound(), rate);
         }
     }
 

@@ -57,24 +57,7 @@ ALR can occur when your application sends **less than 80% of the
 estimated bitrate** – for example, during silence suppression in audio, or when
 video is paused. This is important because:
 
-1. **Loss patterns differ**: During normal operation, loss indicates
-   congestion. During ALR, loss could be unrelated to your sending rate
-   since you're barely using the network. Without ALR awareness, the loss
-   controller might incorrectly reduce estimates based on irrelevant loss.
-
-2. **Capacity discovery**: When operating in ALR, we don't know the true
-   network capacity because we're not pushing against it. The ALR detector
-   tracks this state and provides it to probe control and loss controller
-   for appropriate behavior.
-
-3. **Accurate bounds**: Successful ALR probes provide proven capacity
-   measurements. The loss controller uses these as upper bounds during
-   ALR, preventing it from estimating beyond what we've actually
-   demonstrated the network can handle.
-
-Without ALR integration, the BWE system treats application-limited
-scenarios the same as network-limited ones, leading to incorrect estimates
-and slower adaptation when application demand resumes.
+When media production is low, periodic ALR probes help discover spare capacity.
 
 ## Signal Flow Diagram
 
@@ -85,7 +68,6 @@ and slower adaptation when application demand resumes.
 - 🔵 **Blue (thick)**: Application/Network output (final estimate, packet
   transmission)
 - 🟣 **Purple**: Probe measurements (ALR probe results)
-- 🟠 **Orange (thick)**: ALR capacity constraint (proven capacity bound)
 - ⚫ **Black**: Internal/control signals (TWCC feedback, configuration)
 
 ## Component Overview
@@ -120,8 +102,7 @@ configurations via `maybe_create_probe()` when bandwidth discovery is
 needed, and tracking when probes complete. It monitors for overuse
 conditions via `is_overusing()` which influences both probe scheduling and
 pacer behavior. Throughout operation, it tracks ALR (Application Limited
-Region) state by forwarding information to probe control and loss
-controller.
+Region) state and forwards it to probe control.
 
 ### Delay Controller
 
@@ -295,11 +276,7 @@ bound, with a minimum of 1 kbps. This prevents sustained loss from driving
 the estimate toward zero despite evidence that packets are still being
 delivered.
 
-The controller integrates with ALR detection and link capacity tracking.
-When in ALR, it uses proven link capacity from successful ALR probes as an
-upper bound on estimates, preventing overestimation in application-limited
-scenarios. The loss controller keeps its observation history when entering or
-leaving ALR.
+The loss controller keeps its observation history across ALR transitions.
 
 The loss-based bandwidth estimate flows to the SendSideBandwidthEstimator
 where it's merged with the delay-based estimate, along with the loss
@@ -355,8 +332,6 @@ concepts are unified into this single value.
    Probe rates use allocation scales of 1× and 2× desired, each capped at
    2× the current estimate. The second probe is queued only when its capped
    rate exceeds the first probe's rate.
-   Allocation probes outside ALR are not classified as ALR probes for
-   link-capacity estimation.
 
    Periodic ALR probing is a separate trigger: after receiving nonempty
    transport feedback, it probes while in ALR at 2× desired bitrate with a
@@ -511,9 +486,7 @@ must not exceed 2.0 (physics check).
 
 When multiple probes are updated in a single `update()` call, the iterator
 yields results in the order they were last updated, ensuring the
-DelayController receives the most recent probe result last. For ALR probes,
-all successful results are forwarded to the LinkCapacityEstimator (which
-takes the maximum), while the DelayController uses only the latest result.
+DelayController receives the most recent probe result last.
 
 ### ALR Detector
 
@@ -554,47 +527,13 @@ entry/exit, disrupting probe scheduling and loss estimation.
 These defaults come from libwebrtc’s `WebRTC-ProbingScreenshareBwe` field trial,
 enabled by default since 2019.
 
-The SendSideBandwidthEstimator calls `on_media_sent()` for each media
-packet (excluding padding and probes), passing the packet size and
-timestamp. While probing is available, application-supplied timeout inputs
-advance the same budget with zero media bytes after a 500ms idle interval, so
-complete silence can enter ALR without changing packet-driven updates during media.
-It also calls `set_estimated_bitrate()` whenever the bandwidth
-estimate changes, which adjusts the target rate to 80% of the new
-estimate. The ALR start time flows to both ProbeControl and LossController
-via `alr_start_time()`, providing context for probe gating decisions and
-loss-based estimation during application-limited operation.
+The detector charges media payload bytes and excludes padding. The ALR state controls eligibility for
+periodic and recovery probes.
+
+While probing is available, the budget can advance with zero bytes after
+500 ms of inactivity, allowing a silent sender to enter ALR.
 
 The `IntervalBudget` is located in `src/bwe/alr_detector/budget.rs`.
-
-### Link Capacity Estimator
-
-**Location:** `src/bwe/link_capacity_estimator.rs`
-**WebRTC:** `modules/congestion_controller/goog_cc/link_capacity_estimator.cc`
-
-Tracks proven link capacity based on successful probe results obtained
-during Application Limited Region (ALR). When the application sends less
-than network capacity, probes can discover the true available bandwidth
-without being constrained by application sending patterns—we can send test
-bursts that exceed our normal traffic to find the real limit. The estimator
-only accepts probe results from ALR probes, as these represent genuine
-capacity measurements rather than application-limited observations.
-
-The capacity estimate is stored with a timestamp and expires after 60
-seconds (`capacity_estimate_reset_window`), since network conditions can
-change over time (route changes, competing traffic, etc.). When a new ALR
-probe succeeds, the estimator takes the maximum of the new result and any
-existing estimate, ensuring capacity doesn't decrease from successful
-measurements—only from time-based decay. This "take the max" approach is
-safe because successful probe delivery proves the network can handle that
-rate.
-
-This proven capacity flows to the LossController as an upper bound during
-ALR operation. By capping loss-based estimates at the demonstrated
-capacity, it prevents the loss controller from overestimating bandwidth in
-scenarios where loss patterns might otherwise lead to inflated values. The
-link capacity integration is part of WebRTC's full LossBasedBweV2
-implementation, providing more accurate estimation when operating in ALR.
 
 ### Pacer
 
@@ -821,8 +760,8 @@ transmission smoothing and padding generation respectively.
 - Probe bitrate estimation (send/recv rate calculation and ratio
   validation)
 - Robust throughput estimation from TWCC send and receive times
-- Loss-based estimation with ALR integration and link capacity tracking
-- ALR detection for probe scheduling and loss controller bounds
+- Loss-based estimation from completed loss observations
+- ALR detection for probe scheduling
 
 ## Optional WebRTC Policies
 
