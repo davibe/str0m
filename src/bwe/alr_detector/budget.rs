@@ -44,6 +44,13 @@ impl IntervalBudget {
         }
     }
 
+    // IntervalBudget credits whole bytes from whole kbit/s and milliseconds.
+    fn credit(rate: Bitrate, elapsed: Duration) -> DataSize {
+        let kbps = (rate.as_f64() / 1000.0).round() as u128;
+        let ms = (elapsed.as_micros() + 500) / 1000;
+        DataSize::bytes((kbps.saturating_mul(ms) / 8).min(i64::MAX as u128) as i64)
+    }
+
     /// Update the target bitrate.
     ///
     /// Called when the BWE estimate changes. Clamps existing bytes_remaining
@@ -69,7 +76,7 @@ impl IntervalBudget {
     /// - If true: underuse accumulates (for ALR detection)
     /// - If false: budget resets each interval (for pacing)
     pub fn increase_budget(&mut self, delta_time: Duration) {
-        let bytes = self.target_rate * delta_time;
+        let bytes = Self::credit(self.target_rate, delta_time);
 
         let max = self.max_bytes_in_budget;
         if self.bytes_remaining.as_bytes_i64() < 0 || self.can_build_up_underuse {
@@ -116,7 +123,7 @@ impl IntervalBudget {
 
     /// Calculate max_bytes_in_budget from target rate
     fn calculate_max_bytes(target_rate: Bitrate) -> DataSize {
-        target_rate * Self::WINDOW
+        Self::credit(target_rate, Self::WINDOW)
     }
 
     #[cfg(test)]
@@ -151,6 +158,15 @@ mod tests {
 
         // Budget ratio should be positive (underuse)
         assert!(budget.budget_ratio() > 0.0);
+    }
+
+    #[test]
+    fn credits_whole_milliseconds_and_truncates_partial_bytes() {
+        let mut budget = IntervalBudget::new(Bitrate::bps(81_400), true);
+        budget.increase_budget(Duration::from_micros(1600));
+        assert_eq!(budget.bytes_remaining(), 20);
+        budget.increase_budget(Duration::from_secs(1));
+        assert_eq!(budget.bytes_remaining(), 5062);
     }
 
     #[test]

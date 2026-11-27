@@ -958,9 +958,14 @@ impl Session {
 
             if let RtcpFb::Twcc(twcc) = fb {
                 trace!("Handle TWCC: {:?}", twcc);
-                let maybe_records = self.twcc_tx_register.apply_report(twcc, now);
+                let maybe_records = self
+                    .twcc_tx_register
+                    .apply_report_with_outstanding(twcc, now);
 
-                if let (Some(maybe_records), Some(bwe)) = (maybe_records, &mut self.bwe) {
+                if let (Some((outstanding, maybe_records)), Some(bwe)) =
+                    (maybe_records, &mut self.bwe)
+                {
+                    bwe.set_outstanding_bytes(outstanding);
                     bwe.update(maybe_records, now);
                 }
                 need_configure_pacer = true;
@@ -1316,6 +1321,7 @@ impl Session {
             self.twcc_tx_register
                 .register_seq(packet_id, sent_at, payload_size);
             if let Some(bwe) = &mut self.bwe {
+                bwe.set_outstanding_bytes(self.twcc_tx_register.outstanding_bytes());
                 bwe.on_twcc_packet_sent(sent_at);
             }
         }

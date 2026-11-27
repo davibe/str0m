@@ -330,21 +330,17 @@ concepts are unified into this single value.
    rate exceeds the first probe's rate.
 
    Periodic ALR probing is a separate trigger: after receiving nonempty
-   transport feedback, it probes while in ALR at 2× desired bitrate with a
+   transport feedback, it probes while in ALR at 2× the current estimate with a
    minimum interval of 5 seconds. Empty feedback does not enable ALR probing.
    Initial capacity discovery does not require feedback first. Entering ALR
    alone does not trigger an allocation probe, and periodic ALR probing
    continues even when the estimate has reached the desired bitrate.
 
-4. **Large-Drop Recovery**: After a bitrate drop to 66% or below
-   (`BITRATE_DROP_THRESHOLD`), if the drop occurred within 5 seconds
-   (`BITRATE_DROP_TIMEOUT`) and at least 5 seconds have passed since the
-   last recovery probe (`MIN_TIME_BETWEEN_ALR_PROBES`), probes at 85% of
-   the pre-drop rate (`PROBE_FRACTION_AFTER_DROP`). Only active when in
-   ALR or within 3 seconds after leaving ALR (`ALR_ENDED_TIMEOUT`). This
-   recovers from temporary network glitches—if we suddenly dropped due to
-   transient congestion but are now in ALR (low utilization), it's worth
-   testing if we can return to the higher rate.
+4. **Large-drop recovery.** When delay changes from underuse to normal after
+   a drop below 66% of the previous estimate, the controller can request
+   one probe at 85% of the pre-drop rate. The drop must be less than 5 s
+   old, and the sender must be in ALR or have left it less than 3 s ago.
+   A pending probe result or a congestion gate can suppress the request.
 
 5. **Stagnant Estimate Probing** (str0m addition): When the estimate has
    remained unchanged (within 5%) for 15+ seconds
@@ -366,7 +362,7 @@ concepts are unified into this single value.
 The controller blocks probing based on `BandwidthLimitedCause` state to
 avoid making congestion worse:
 
-- **Suppressed entirely** when `DelayBasedLimitedDelayIncreased` (delay
+- **Suppressed entirely** during RTT backoff or when `DelayBasedLimitedDelayIncreased` (delay
   increasing) or `LossLimitedBwe` (loss-limited and decreasing): The
   network is showing clear signs of congestion (increasing queuing delay
   or packet loss). Sending probe bursts would add more traffic to
@@ -725,8 +721,8 @@ transmission smoothing and padding generation respectively.
 
 5. **Periodic ALR Probing:**
    - **WebRTC**: Optional periodic ALR probes at 2× current estimate
-   - **str0m**: Periodic ALR probes are enabled with BWE and target 2× desired
-     bitrate after transport feedback arrives, with a minimum interval of
+   - **str0m**: Periodic ALR probes are enabled with BWE and target 2× the current
+     estimate after transport feedback arrives, with a minimum interval of
      5 seconds
    - **Reason**: Rediscover capacity while application demand remains constant
    - **Impact**: Capacity discovery during ALR does not depend on an allocation
@@ -776,7 +772,7 @@ strings; its periodic ALR behavior is described below.
   2.0`
 - **Status**: Optional feature, must be explicitly enabled by application
 - **str0m behavior**: Enabled when BWE can probe and transport feedback
-  has arrived. The periodic probe target is 2× desired bitrate.
+  has arrived. The periodic probe target is 2× the current estimate.
 
 ### Repeated Initial Probing
 - **API**: `StreamsConfig.enable_repeated_initial_probing = true`

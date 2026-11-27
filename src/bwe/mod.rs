@@ -23,6 +23,7 @@ use crate::util::Soonest;
 
 mod alr_detector;
 pub(crate) mod api;
+mod congestion_window;
 mod delay;
 mod loss_controller;
 mod macros;
@@ -48,6 +49,8 @@ pub(crate) use probe::{ProbeClusterState, ProbeControl};
 pub use probe::ProbeClusterConfig;
 #[cfg(not(feature = "_internal_test_exports"))]
 pub(crate) use probe::ProbeClusterConfig;
+
+const MIN_BITRATE: Bitrate = Bitrate::kbps(40);
 
 pub struct Bwe {
     bwe: SendSideBandwidthEstimator,
@@ -111,14 +114,18 @@ impl Bwe {
         self.bwe.delay_controller.update_rtt(rtt);
     }
 
+    pub(crate) fn set_outstanding_bytes(&mut self, bytes: usize) {
+        self.bwe.window.outstanding = bytes;
+    }
+
     pub fn on_media_sent(&mut self, payload_size: DataSize, is_padding: bool, now: Instant) {
         if !is_padding {
-            // Update ALR detector with media bytes sent
-            self.bwe.on_media_sent(payload_size, now);
+            self.bwe.alr_detector.on_bytes_sent(payload_size, now);
         }
     }
 
     pub fn on_twcc_packet_sent(&mut self, now: Instant) {
+        self.bwe.update_encoder_target(now);
         self.bwe.rtt_backoff.on_packet_sent(now);
     }
 
@@ -146,7 +153,9 @@ struct SendSideBandwidthEstimator {
     // First nonempty transport feedback; starts loss estimation and enables ALR probing.
     started_at: Option<Instant>,
     alr_detector: AlrDetector,
-    last_updated_estimate: Option<Bitrate>,
+    window: congestion_window::CongestionWindow,
+    encoder_target: Option<Bitrate>,
+    last_propagated: Option<(Bitrate, bool, Option<Bitrate>)>,
 }
 
 #[derive(Default)]
@@ -217,8 +226,6 @@ impl RttBasedBackoff {
     }
 }
 
-const MIN_BITRATE: Bitrate = Bitrate::kbps(40);
-
 impl SendSideBandwidthEstimator {
     pub fn new(initial_bitrate: Bitrate) -> Self {
         let mut alr_detector = AlrDetector::new();
@@ -235,7 +242,9 @@ impl SendSideBandwidthEstimator {
             probe_estimator: ProbeEstimator::new(),
             started_at: None,
             alr_detector,
-            last_updated_estimate: None,
+            window: Default::default(),
+            encoder_target: None,
+            last_propagated: None,
         }
     }
 
@@ -245,14 +254,6 @@ impl SendSideBandwidthEstimator {
     /// re-excite the system while we're already congested.
     pub fn is_overusing(&self) -> bool {
         self.delay_controller.is_overusing()
-    }
-
-    /// Update ALR detector with actual bytes sent.
-    ///
-    /// Should be called for media packets (not padding/probes).
-    /// This is typically called from the session's packet sending logic.
-    pub fn on_media_sent(&mut self, bytes: DataSize, now: Instant) {
-        self.alr_detector.on_bytes_sent(bytes, now);
     }
 
     /// Record a packet from a TWCC report.
@@ -283,8 +284,15 @@ impl SendSideBandwidthEstimator {
             (send_records.len() - acked_packets.len()) as f64 / send_records.len() as f64
         });
         acked_packets.sort_by(AckedPacket::order_by_receive_time);
-
+        if let Some(rtt) = acked_packets
+            .iter()
+            .map(|packet| now.duration_since(packet.local_send_time))
+            .max()
+        {
+            self.window.record_rtt(rtt);
+        }
         self.rtt_backoff.on_feedback(&acked_packets, now);
+
         self.acked_bitrate_estimator.update(&acked_packets);
         let acked_bitrate = self.acked_bitrate_estimator.current_estimate();
 
@@ -292,16 +300,19 @@ impl SendSideBandwidthEstimator {
         let probe_result = latest_probe_result;
 
         // Update delay controller with the latest probe result
-        let maybe_estimate =
+        let (maybe_estimate, recovered) =
             self.delay_controller
                 .update(&acked_packets, acked_bitrate, probe_result, now);
 
         let is_probe_result = probe_result.is_some() && !self.delay_controller.is_overusing();
         let Some(delay_estimate) = maybe_estimate else {
+            if recovered {
+                self.probe_control.request_recovery(now);
+            }
             return;
         };
 
-        // Apply the new delay limit (or probe target) before the RTT decrease.
+        // GoogCC applies a new delay limit (or probe target) before the RTT decrease.
         let current_target = if is_probe_result {
             Some(delay_estimate)
         } else {
@@ -318,8 +329,18 @@ impl SendSideBandwidthEstimator {
         self.loss_controller
             .update_bandwidth_estimate(&send_records, delay_estimate);
 
-        // Feed the (possibly combined) estimate into subcomponents wanting it.
-        self.propagate_estimate();
+        self.finish_feedback(now, recovered);
+    }
+
+    fn finish_feedback(&mut self, now: Instant, recovered: bool) {
+        self.update_encoder_target(now);
+        // Evaluate recovery with the limitation cause propagated by this feedback.
+        if recovered {
+            self.probe_control.request_recovery(now);
+        }
+        if let Some(rate) = self.last_estimate() {
+            self.window.resize(rate);
+        }
     }
 
     pub fn poll_timeout(&self) -> (Option<Instant>, Reason) {
@@ -336,11 +357,18 @@ impl SendSideBandwidthEstimator {
         do_probe: bool,
         now: Instant,
     ) -> Option<ProbeClusterConfig> {
-        let current_target = self.last_estimate();
+        self.rtt_backoff.update(
+            now,
+            self.last_estimate(),
+            self.delay_controller.last_estimate(),
+        );
 
-        self.rtt_backoff
-            .update(now, current_target, self.delay_controller.last_estimate());
-
+        if self.window.process_due(now) {
+            if let Some(rate) = self.last_estimate() {
+                self.window.resize(rate);
+            }
+            self.update_encoder_target(now);
+        }
         self.delay_controller.start_clock(now);
         // Update probe control with desired bitrate.
         self.probe_control.set_desired_bitrate(desired_bitrate);
@@ -364,7 +392,7 @@ impl SendSideBandwidthEstimator {
         self.probe_estimator.handle_timeout(now);
 
         // Feed the current estimate into subcontrollers, if it changed.
-        self.propagate_estimate();
+        self.propagate_estimate(now);
 
         // If we can't probe, clear any pending/active probes
         if !do_probe {
@@ -377,28 +405,44 @@ impl SendSideBandwidthEstimator {
         self.probe_control.handle_timeout(now)
     }
 
-    fn propagate_estimate(&mut self) {
+    fn update_encoder_target(&mut self, now: Instant) {
+        if let Some(rate) = self.last_estimate() {
+            self.encoder_target = Some(self.window.encoder_target(rate));
+        }
+        self.propagate_estimate(now);
+    }
+
+    fn propagate_estimate(&mut self, now: Instant) {
         // Do we have a value?
         let Some(estimate) = self.last_estimate() else {
             return;
         };
-        // Did it change?
-        if self.last_updated_estimate == Some(estimate) {
+        // GoogCC also refreshes the probe controller's stored cause on ALR transitions.
+        let rate_and_alr = (
+            estimate,
+            self.alr_detector.alr_start_time().is_some(),
+            self.encoder_target,
+        );
+        if self.last_propagated == Some(rate_and_alr) {
             return;
         }
 
         let cause = self.bandwidth_limited_cause();
 
-        self.probe_control.set_estimated_bitrate(estimate, cause);
+        self.probe_control
+            .set_estimated_bitrate(now, estimate, cause);
         self.alr_detector.set_estimated_bitrate(estimate);
 
-        // Don't update until this changes.
-        self.last_updated_estimate = Some(estimate);
+        self.last_propagated = Some(rate_and_alr);
     }
 
     fn bandwidth_limited_cause(&self) -> BandwidthLimitedCause {
-        if self.delay_controller.is_overusing() {
+        if self.delay_controller.usage() != BandwidthUsage::Normal {
             return BandwidthLimitedCause::DelayBasedLimitedDelayIncreased;
+        }
+
+        if self.rtt_backoff.target.is_some() {
+            return BandwidthLimitedCause::RttBasedBackoff;
         }
 
         match self.loss_controller.loss_based_result().state {

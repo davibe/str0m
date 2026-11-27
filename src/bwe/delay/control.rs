@@ -64,7 +64,9 @@ impl DelayController {
         acked_bitrate: Option<Bitrate>,
         probe_bitrate: Option<Bitrate>,
         now: Instant,
-    ) -> Option<Bitrate> {
+    ) -> (Option<Bitrate>, bool) {
+        let mut recovered = false;
+
         for acked_packet in acked {
             if let Some(mut delay_variation) = self
                 .arrival_group_accumulator
@@ -85,8 +87,11 @@ impl DelayController {
                 // delay variations, not absolute times.
                 delay_variation.last_remote_recv_time =
                     self.trendline_timestamp(delay_variation.last_remote_recv_time);
+                let previous = self.trendline_estimator.hypothesis();
                 self.trendline_estimator
                     .add_delay_observation(delay_variation, delay_variation.last_remote_recv_time);
+                recovered |=
+                    previous == BandwidthUsage::Underuse && self.usage() == BandwidthUsage::Normal;
             }
         }
 
@@ -96,12 +101,19 @@ impl DelayController {
             self.update_estimate(new_hypothesis, acked_bitrate, probe_bitrate, now);
         }
 
-        self.last_estimate
+        (
+            self.last_estimate,
+            recovered && !self.is_overusing() && probe_bitrate.is_none(),
+        )
     }
 
     /// Get the latest estimate.
     pub fn last_estimate(&self) -> Option<Bitrate> {
         self.last_estimate
+    }
+
+    pub fn usage(&self) -> BandwidthUsage {
+        self.trendline_estimator.hypothesis()
     }
 
     /// Whether the delay-based detector currently signals overuse.

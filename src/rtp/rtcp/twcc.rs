@@ -1064,6 +1064,7 @@ impl<'a> TryFrom<&'a [u8]> for PacketChunk {
 
 #[derive(Debug)]
 pub struct TwccSendRegister {
+    outstanding_bytes: usize,
     /// How many send records to keep.
     keep: usize,
 
@@ -1222,6 +1223,7 @@ pub struct TwccRecvReport {
 impl TwccSendRegister {
     pub fn new(keep: usize) -> Self {
         TwccSendRegister {
+            outstanding_bytes: 0,
             keep,
             queue: VecDeque::new(),
             time_zero: None,
@@ -1231,19 +1233,28 @@ impl TwccSendRegister {
     }
 
     pub fn register_seq(&mut self, packet_id: TwccPacketId, now: Instant, size: usize) {
+        let payload_size = size as u16;
+        self.outstanding_bytes += usize::from(payload_size);
         self.last_registered = packet_id.seq();
         self.queue.push_back(TwccSendRecord {
             packet_id,
             local_send_time: now,
             // In practice the max sizes is constrained by the MTU and will max out around 1200
             // bytes, hence this cast is fine.
-            size: size as u16,
+            size: payload_size,
             // The recv report, derived from TWCC feedback later.
             recv_report: None,
         });
         while self.queue.len() > self.keep {
-            self.queue.pop_front();
+            let evicted = self.queue.pop_front().unwrap();
+            if evicted.recv_report.is_none() {
+                self.outstanding_bytes -= evicted.size();
+            }
         }
+    }
+
+    pub(crate) fn outstanding_bytes(&self) -> usize {
+        self.outstanding_bytes
     }
 
     /// Apply a TWCC RTCP report.
@@ -1255,6 +1266,15 @@ impl TwccSendRegister {
         twcc: Twcc,
         now: Instant,
     ) -> Option<impl Iterator<Item = &TwccSendRecord>> {
+        self.apply_report_with_outstanding(twcc, now)
+            .map(|(_, records)| records)
+    }
+
+    pub(crate) fn apply_report_with_outstanding(
+        &mut self,
+        twcc: Twcc,
+        now: Instant,
+    ) -> Option<(usize, impl Iterator<Item = &TwccSendRecord>)> {
         if self.time_zero.is_none() {
             self.time_zero = Some(now);
         }
@@ -1289,6 +1309,7 @@ impl TwccSendRegister {
 
         fn update(
             now: Instant,
+            outstanding: &mut usize,
             r: &mut TwccSendRecord,
             seq: TwccSeq,
             remote_recv_time: Option<Instant>,
@@ -1298,6 +1319,9 @@ impl TwccSendRegister {
                 return false;
             }
 
+            if r.recv_report.is_none() {
+                *outstanding -= r.size();
+            }
             let apply_report_counter = if let Some(rr) = r.recv_report {
                 // This packed was already acked and handled before so carry
                 // over previous apply_report_counter, so it won't be included
@@ -1325,6 +1349,7 @@ impl TwccSendRegister {
 
         if !update(
             now,
+            &mut self.outstanding_bytes,
             first_record,
             first_seq_no,
             first_instant,
@@ -1339,7 +1364,14 @@ impl TwccSendRegister {
                 break;
             }
 
-            if !update(now, record, seq, instant, apply_report_counter) {
+            if !update(
+                now,
+                &mut self.outstanding_bytes,
+                record,
+                seq,
+                instant,
+                apply_report_counter,
+            ) {
                 problematic_seq = Some((record.seq(), seq));
             }
             last_seq_no = seq;
@@ -1356,7 +1388,8 @@ impl TwccSendRegister {
 
         let range = first_seq_no..=last_seq_no;
 
-        Some(
+        Some((
+            self.outstanding_bytes,
             TwccSendRecordsIter {
                 range: range.clone(),
                 index: first_index,
@@ -1371,7 +1404,7 @@ impl TwccSendRegister {
                     .map(|r| r.apply_report_counter == apply_report_counter)
                     .unwrap_or_default()
             }),
-        )
+        ))
     }
 
     /// Calculate the egress loss for given time window.
@@ -2529,6 +2562,23 @@ mod test {
             .into(),
             delta: (0..status_count).map(|_| Delta::Small(10)).collect(),
         }
+    }
+
+    #[test]
+    fn outstanding_bytes_account_for_overlapping_reports_and_eviction() {
+        let now = Instant::now();
+        let mut register = TwccSendRegister::new(3);
+        for seq in 0..3 {
+            register.register_seq(TwccPacketId::new(seq), now, 100);
+        }
+        for expected in [100, 100] {
+            let (outstanding, _) = register
+                .apply_report_with_outstanding(received(1, 2), now)
+                .unwrap();
+            assert_eq!(outstanding, expected);
+        }
+        register.register_seq(TwccPacketId::new(3), now, 240);
+        assert_eq!(register.outstanding_bytes(), 240);
     }
 
     #[test]
